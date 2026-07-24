@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/
+*.workdir/
+*.vi.epub
+*.glossary.json
+
+# Local Claude settings
+.claude/settings.local.json
+
+# Generated outputs / logs (sample artifacts, not source)
+*.log
+*.epub
+*.analysis.json
+/Tom-tat_*.md
+/input.*
