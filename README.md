@@ -122,6 +122,7 @@ Các tuỳ chọn:
 | `--proxy` | Dùng proxy vertex-key (legacy, cần `VERTEX_KEY_API_KEY`) |
 | `--base-url <url>` | Base URL proxy, chỉ dùng kèm `--proxy` |
 | `--glossary file.json` | Dùng glossary có sẵn thay vì tự xây |
+| `--cover anh.jpg` | Ảnh bìa tự chọn (xem [Ảnh bìa](#ảnh-bìa)) |
 | `--max-chapters N` | Chỉ dịch N chương đầu (dịch thử) |
 | `--keep-workdir` | Giữ thư mục cache `<output>.workdir` sau khi xong |
 
@@ -137,7 +138,7 @@ Cấu trúc sách tóm tắt:
 - **"Về cuốn sách này"** mở đầu: giới thiệu + **Tóm tắt 1 trang** (nắm bức tranh lớn trước khi vào từng bài).
 - **Mỗi bài học** (2.400–4.000 từ, ≈ 15–25 phút): vì sao phần này quan trọng → từng mục giải thích cơ chế với ví dụ từ sách → box *Góc nhìn thêm* (bình luận từ kiến thức ngoài sách, tách bạch rõ) → box *Điểm chính* → box *Thực hành* (2–3 câu hỏi tự vấn + 1 hành động cụ thể).
 - **"Tổng kết"** cuối sách: xâu chuỗi toàn bộ + nhìn lại mọi điểm chính.
-- **Bìa**: dùng lại nguyên bản ảnh bìa gốc của sách, đặt làm trang bìa chuẩn (EPUB2 + EPUB3) để hiển thị đúng trên mọi reader.
+- **Bìa**: dùng lại nguyên bản ảnh bìa gốc của sách, đặt làm trang bìa chuẩn (EPUB2 + EPUB3) để hiển thị đúng trên mọi reader. Xem mục [Ảnh bìa](#ảnh-bìa).
 
 Chương gốc quá ngắn được gộp, quá dài được tách nhiều bài (chương rất dài đi qua bước trích notes từng đoạn trước khi viết bài). Trang bìa/mục lục/bản quyền/index tự bị bỏ qua — có thể sửa lại trong `*.analysis.json` rồi chạy lại.
 
@@ -148,8 +149,31 @@ Các tuỳ chọn riêng (các flag `--model`, `--anthropic`, `--project`, `--re
 | Tuỳ chọn | Ý nghĩa |
 |---|---|
 | `-o output.epub` | File ra (mặc định `<input>_short.epub`) |
+| `--cover anh.jpg` | Ảnh bìa tự chọn (xem [Ảnh bìa](#ảnh-bìa)) |
 | `--analysis file.json` | Dùng analysis có sẵn thay vì tự phân tích |
 | `--max-lessons N` | Chỉ sinh N bài đầu (chạy thử; bỏ bài mở đầu/tổng kết) |
+
+## Ảnh bìa
+
+Mặc định tool dùng lại **ảnh bìa gốc** của sách. Nhưng nhiều EPUB do calibre
+convert khai báo bìa sai: khi sách gốc không có bìa thật, calibre lấy đại ảnh
+đầu tiên trong manifest — thường là một **trang scan nội dung** (index, mục lục,
+hình minh hoạ). Sách xuất ra khi đó có "bìa" là một trang chữ li ti.
+
+Nên trước khi nhúng, tool gửi ảnh bìa qua **LLM vision** hỏi xem nó có thật sự
+là bìa sách không (một request nhỏ, kết quả được cache theo nội dung ảnh nên
+chạy lại không tốn thêm). Nếu không đạt, bìa bị bỏ kèm cảnh báo.
+
+Muốn có bìa đúng, tải ảnh bìa sách rồi truyền vào — khi có `--cover` thì bỏ qua
+bước kiểm tra:
+
+```powershell
+.\.venv\Scripts\ebook-summarize.exe sach.epub --cover bia.jpg
+```
+
+Nhận `.jpg`, `.png`, `.gif`, `.webp`; định dạng ngoài chuẩn EPUB3 (vd webp) được
+tự chuyển sang JPEG cho tương thích reader. Cả `ebook-translate` lẫn
+`ebook-summarize` đều có flag này.
 
 ## Quy trình bên trong
 
@@ -174,6 +198,7 @@ src\ebook_translator\
 │   ├── pdf_reader.py       # PDF text -> Book (PyMuPDF)
 │   └── ocr.py              # phát hiện trang scan + OCR bằng LLM vision
 ├── core\
+│   ├── cover.py            # xác thực ảnh bìa (LLM vision) + xử lý --cover
 │   ├── segmenter.py        # cắt HTML thành chunk
 │   ├── glossary.py         # xây/quản lý glossary EN->VI
 │   ├── translator.py       # dịch nội dung + tiêu đề

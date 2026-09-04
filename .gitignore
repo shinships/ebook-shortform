@@ -4,8 +4,14 @@ __pycache__/
 build/
 dist/
 *.workdir/
+*.workdir_*/
+workdir_fisher/
+.env
+.env.*
 *.vi.epub
 *.glossary.json
+.DS_Store
+lessons_output/
 
 # Local Claude settings
 .claude/settings.local.json
@@ -14,7 +20,23 @@ dist/
 *.log
 *.epub
 *.analysis.json
+*.zip
 /Tom-tat_*.md
 /input.*
+
+# Pipeline runtime contents (folders tracked via .gitkeep)
+/inbox/*
+!/inbox/.gitkeep
+/output/*
+!/output/.gitkeep
+!/output/originals/
+/output/originals/*
+!/output/originals/.gitkeep
+/processing/*
+!/processing/.gitkeep
+/logs/*
+!/logs/.gitkeep
+/marketing/*
+!/marketing/.gitkeep
 .venv-mac/
 .venv-windows-old/

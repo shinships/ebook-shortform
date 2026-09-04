@@ -56,7 +56,8 @@ LESSON_CSS = """
 .action-box, .exercise-box { border-left-color: #3f9d63; background: #eef7f1; }
 .commentary-box { border-left-color: #b58a3c; background: #faf5ec; font-style: italic; }
 .commentary-box strong, .commentary-box em { font-style: normal; }
-.insights-box p, .action-box p, .exercise-box p, .commentary-box p {
+.assumptions-box { border-left-color: #9c4f4f; background: #faf0f0; }
+.insights-box p, .action-box p, .exercise-box p, .commentary-box p, .assumptions-box p {
   text-indent: 0; margin: 0.3em 0;
 }
 .box-title { font-weight: bold; font-size: 1.05em; margin-bottom: 0.4em; font-style: normal; }
@@ -147,17 +148,19 @@ Return ONLY valid JSON (no markdown fence) with EXACTLY this shape:
   "intro": "<1-2 đoạn <p> HTML: phần này của sách nói về gì và VÌ SAO nó quan trọng với người đọc>",
   "sections": [{{
     "heading": "<tiêu đề mục tiếng Việt>",
-    "html": "<3-6 đoạn <p>: giải thích CƠ CHẾ của ý tưởng (vì sao đúng, hoạt động thế nào), kèm ví dụ/câu chuyện/số liệu cụ thể từ sách; có thể dùng <ul>/<li>, <strong>, <em>, <blockquote>>",
+    "reasoning": "<BẮT BUỘC — 2-3 câu tiếng Việt tái hiện MẠCH LẬP LUẬN của tác giả: tiền đề tác giả xuất phát từ đâu, suy luận thế nào để đi tới kết luận. Trả lời 'VÌ SAO đúng', không chỉ 'đúng cái gì'. Viết như văn xuôi thường, KHÔNG dùng HTML tag.>",
+    "html": "<3-6 đoạn <p>: giải thích CƠ CHẾ của ý tưởng (hoạt động thế nào trong thực tế), kèm ví dụ/câu chuyện/số liệu cụ thể từ sách; có thể dùng <ul>/<li>, <strong>, <em>, <blockquote>>",
     "commentary": "<TÙY CHỌN — 1-2 đoạn <p>: đối chiếu với nghiên cứu/sách khác, phản biện, hoặc bối cảnh bổ sung từ kiến thức NGOÀI cuốn sách (nêu rõ nguồn tham chiếu). Để chuỗi rỗng nếu không có gì thật sự đáng nói.>"
   }}],
   "key_insights": ["<ý chính cô đọng, 1-2 câu tiếng Việt>", "..."],
+  "assumptions_limits": "<BẮT BUỘC — 1 đoạn <p> HTML (2-4 câu): bối cảnh/giả định ngầm mà tác giả coi là hiển nhiên (thời đại, thị trường, loại người/tổ chức mà lập luận này dựa vào), và khi nào lời khuyên trong bài KHÔNG áp dụng được hoặc cần thận trọng. Đây là ý kiến đánh giá của bạn (người viết guide), không phải ý tác giả — được phép dùng kiến thức ngoài sách.>",
   "exercises": ["<câu hỏi tự vấn giúp người đọc soi ý tưởng vào đời sống/công việc của chính mình>", "..."],
   "action": "<1 đoạn <p> HTML: MỘT hành động cụ thể người đọc có thể làm ngay hôm nay từ bài học này>"
 }}
 Constraints:
 - 2-5 sections; 3-6 key_insights; 2-3 exercises.
-- TOTAL length across intro + sections + commentary + insights + exercises + action: {words_min}-{words_max} Vietnamese words.
-- Allowed HTML tags ONLY: p, ul, ol, li, strong, em, blockquote.
+- TOTAL length across intro + sections + commentary + assumptions_limits + insights + exercises + action: {words_min}-{words_max} Vietnamese words.
+- Allowed HTML tags ONLY: p, ul, ol, li, strong, em, blockquote (assumptions_limits and action use plain <p>; reasoning has NO HTML tags at all).
 """
 
 OVERVIEW_PROMPT = """\
@@ -645,6 +648,7 @@ def _validate_lesson(data: dict | None) -> list[str]:
         ("intro", str),
         ("sections", list),
         ("key_insights", list),
+        ("assumptions_limits", str),
         ("exercises", list),
         ("action", str),
     ):
@@ -663,6 +667,10 @@ def _validate_lesson(data: dict | None) -> list[str]:
             errors.append(f"section {i} must be an object with string 'heading' and 'html'")
         elif "commentary" in sec and not isinstance(sec["commentary"], str):
             errors.append(f"section {i} 'commentary' must be a string (may be empty)")
+        elif not isinstance(sec.get("reasoning", ""), str):
+            errors.append(f"section {i} 'reasoning' must be a string")
+        elif not str(sec.get("reasoning", "")).strip():
+            errors.append(f"section {i} missing 'reasoning' (must explain the author's argument)")
     insights = data["key_insights"]
     if not (3 <= len(insights) <= 6):
         errors.append(f"expected 3-6 key_insights, got {len(insights)}")
@@ -685,9 +693,15 @@ def _validate_lesson(data: dict | None) -> list[str]:
 
 
 def _lesson_word_count(data: dict) -> int:
-    parts = [data["intro"], data["action"], *data["key_insights"], *data["exercises"]]
+    parts = [
+        data["intro"],
+        data["action"],
+        str(data.get("assumptions_limits", "")),
+        *data["key_insights"],
+        *data["exercises"],
+    ]
     parts += [
-        f"{s.get('heading', '')} {s.get('html', '')} {s.get('commentary', '')}"
+        f"{s.get('heading', '')} {s.get('reasoning', '')} {s.get('html', '')} {s.get('commentary', '')}"
         for s in data["sections"]
     ]
     return _word_count(_plain_text(" ".join(parts)))
@@ -711,12 +725,14 @@ def _sanitize_lesson(data: dict) -> dict:
         "sections": [
             {
                 "heading": _plain_text(str(s.get("heading", ""))).strip(),
+                "reasoning": _plain_text(str(s.get("reasoning", "") or "")).strip(),
                 "html": _sanitize_html(str(s.get("html", ""))),
                 "commentary": _sanitize_html(str(s.get("commentary", "") or "")),
             }
             for s in data["sections"]
         ],
         "key_insights": [_plain_text(str(x)).strip() for x in data["key_insights"]],
+        "assumptions_limits": _sanitize_html(str(data.get("assumptions_limits", "") or "")),
         "exercises": [_plain_text(str(x)).strip() for x in data["exercises"]],
         "action": _sanitize_html(str(data["action"])),
     }
@@ -745,6 +761,9 @@ def _render_lesson_html(lesson: dict, index: int, total: int, source_title: str)
     ]
     for sec in lesson["sections"]:
         parts.append(f"<h2>{_escape(sec['heading'])}</h2>")
+        reasoning = (sec.get("reasoning") or "").strip()
+        if reasoning:
+            parts.append(f"<p><em>{_escape(reasoning)}</em></p>")
         parts.append(sec["html"])
         commentary = (sec.get("commentary") or "").strip()
         if commentary and _plain_text(commentary).strip():
@@ -757,6 +776,12 @@ def _render_lesson_html(lesson: dict, index: int, total: int, source_title: str)
         '<div class="insights-box"><p class="box-title">Điểm chính</p>'
         f"<ul>{insights}</ul></div>"
     )
+    assumptions = (lesson.get("assumptions_limits") or "").strip()
+    if assumptions and _plain_text(assumptions).strip():
+        parts.append(
+            '<div class="assumptions-box"><p class="box-title">Giả định &amp; giới hạn</p>'
+            f"{assumptions}</div>"
+        )
     exercises = "".join(f"<li>{_escape(x)}</li>" for x in lesson["exercises"])
     parts.append(
         '<div class="exercise-box"><p class="box-title">Thực hành</p>'

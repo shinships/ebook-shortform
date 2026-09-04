@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from ebook_translator.core.cache import TranslationCache
+from ebook_translator.core.cover import resolve_cover
 from ebook_translator.core.glossary import Glossary, build_glossary
 from ebook_translator.core.llm import (
     ANTHROPIC_DEFAULT_MODEL,
@@ -42,6 +43,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--region", help=f"Region Vertex AI (mặc định: {DEFAULT_REGION})")
     parser.add_argument("--proxy", action="store_true", help="Dùng proxy vertex-key (legacy, cần VERTEX_KEY_API_KEY)")
     parser.add_argument("--base-url", help=f"Base URL API proxy, chỉ dùng kèm --proxy (mặc định: {PROXY_DEFAULT_BASE_URL})")
+    parser.add_argument("--cover", help=(
+        "Ảnh bìa cho sách dịch (.jpg/.png/.gif/.webp). Mặc định dùng bìa của sách "
+        "gốc; nếu bìa gốc không phải bìa thật (trang scan nội dung) thì bị bỏ."
+    ))
     parser.add_argument("--glossary", help="File glossary.json có sẵn (bỏ qua bước tự xây)")
     parser.add_argument("--max-chapters", type=int, help="Chỉ dịch N chương đầu (dịch thử)")
     parser.add_argument("--keep-workdir", action="store_true", help="Giữ thư mục cache sau khi xong")
@@ -81,6 +86,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     if not book.chapters:
         sys.exit("Không trích được nội dung nào từ file đầu vào.")
+
+    # ---- [1b] Chot anh bia ----
+    resolve_cover(book, llm, args.cover, workdir)
 
     if args.no_translate:
         write_epub(book, str(output_path))

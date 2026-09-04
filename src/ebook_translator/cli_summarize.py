@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from ebook_translator.core.cache import TranslationCache
+from ebook_translator.core.cover import resolve_cover
 from ebook_translator.core.llm import (
     ANTHROPIC_DEFAULT_MODEL,
     DEFAULT_REGION,
@@ -55,6 +56,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--region", help=f"Region Vertex AI (mặc định: {DEFAULT_REGION})")
     parser.add_argument("--proxy", action="store_true", help="Dùng proxy vertex-key (legacy, cần VERTEX_KEY_API_KEY)")
     parser.add_argument("--base-url", help=f"Base URL API proxy, chỉ dùng kèm --proxy (mặc định: {PROXY_DEFAULT_BASE_URL})")
+    parser.add_argument("--cover", help=(
+        "Ảnh bìa cho sách tóm tắt (.jpg/.png/.gif/.webp). Mặc định dùng bìa của "
+        "sách gốc; nếu bìa gốc không phải bìa thật (trang scan nội dung) thì bị bỏ."
+    ))
     parser.add_argument("--analysis", help="File analysis.json có sẵn (bỏ qua bước phân tích sách)")
     parser.add_argument("--max-lessons", type=int, help="Chỉ sinh N bài đầu (chạy thử; bỏ bài mở đầu/tổng kết)")
     parser.add_argument("--keep-workdir", action="store_true", help="Giữ thư mục cache sau khi xong")
@@ -90,6 +95,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     if not book.chapters:
         sys.exit("Không trích được nội dung nào từ file đầu vào.")
+
+    # ---- [1b] Chot anh bia ----
+    resolve_cover(book, llm, args.cover, workdir)
 
     # ---- [2] Phan tich sach ----
     analysis_path = Path(args.analysis) if args.analysis else output_path.with_suffix(".analysis.json")
