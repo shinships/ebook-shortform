@@ -195,17 +195,21 @@ class LLMClient:
         delay = 5.0
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                resp = self.client.messages.create(
+                # Streaming bat buoc: SDK Anthropic chan non-streaming khi request
+                # co the chay >10 phut (max_tokens rong). Gom text tu stream.
+                text_parts: list[str] = []
+                with self.client.messages.stream(
                     model=self.model,
                     max_tokens=max_tokens,
                     system=system,
                     messages=messages,
-                )
-                self.input_tokens += resp.usage.input_tokens
-                self.output_tokens += resp.usage.output_tokens
-                return "".join(
-                    block.text for block in resp.content if block.type == "text"
-                )
+                ) as stream:
+                    for chunk in stream.text_stream:
+                        text_parts.append(chunk)
+                    final = stream.get_final_message()
+                self.input_tokens += final.usage.input_tokens
+                self.output_tokens += final.usage.output_tokens
+                return "".join(text_parts)
             except (
                 anthropic.RateLimitError,
                 anthropic.APIStatusError,
