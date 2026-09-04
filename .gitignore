@@ -8,6 +8,7 @@ dist/
 workdir_fisher/
 .env
 .env.*
+!.env.example
 *.vi.epub
 *.glossary.json
 .DS_Store

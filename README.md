@@ -1,210 +1,259 @@
 # ebook-shortform
 
-Tool CLI xử lý ebook bằng LLM, gồm hai lệnh:
+Bộ công cụ CLI và pipeline tự động hóa xử lý ebook bằng LLM, hỗ trợ dịch thuật chuẩn xác và biên soạn **tóm tắt chuyên sâu kiểu Shortform** (microlearning), tích hợp đóng gói chuẩn EPUB3 và tự động gửi file tới nhóm/topic Telegram.
 
-- **`ebook-translate`** — dịch ebook tiếng Anh sang tiếng Việt.
-- **`ebook-summarize`** — tóm tắt ebook thành "sách hướng dẫn chuyên sâu" kiểu Shortform: mỗi bài 15–25 phút trả lời *vì sao ý tưởng quan trọng → cơ chế hoạt động → cách áp dụng*, kèm box "Góc nhìn thêm" (đối chiếu nghiên cứu/sách khác) và bài tập thực hành cuối bài.
+Dự án gồm hai lệnh chính cùng hệ thống kịch bản tự động hóa:
 
-Điểm chung:
+- **`ebook-translate`** — Dịch toàn bộ ebook tiếng Anh sang tiếng Việt, bảo toàn định dạng HTML/CSS, cấu trúc chương mục và hệ thống thuật ngữ nhất quán.
+- **`ebook-summarize`** — Biên soạn tóm tắt ebook thành "sách hướng dẫn chuyên sâu" kiểu Shortform: mỗi bài 15–25 phút trả lời *vì sao ý tưởng quan trọng → cơ chế hoạt động & case study → góc nhìn mở rộng/đối chiếu → tóm lược điểm cốt lõi → bài tập tự vấn & hành động thực tiễn*.
+- **`auto-pipeline.sh`** — Dây chuyền tự động hóa: theo dõi thư mục `inbox/`, tự động tóm tắt sách, ghi log chi tiết và đẩy thẳng file `.epub` vào Topic Telegram.
+- **`scripts/`** — Tiện ích gửi Telegram độc lập (`send_to_telegram.py`) và pipeline tóm tắt chuyên sâu tác phẩm kinh điển của Philip Fisher (`generate_fisher_summaries.py`).
 
-- **Input**: `.epub`, `.pdf` (cả PDF text lẫn PDF scan — trang scan được OCR bằng LLM vision, không cần cài Tesseract)
-- **Output**: `.epub` tiếng Việt, giữ nguyên hình ảnh và cấu trúc mục lục (mục lục cũng được dịch)
-- Dịch dễ hiểu nhưng bám sát nội dung gốc; thuật ngữ/tên riêng nhất quán xuyên suốt nhờ glossary tự xây
-- Có cache: ngắt giữa chừng (Ctrl+C, mất mạng) → chạy lại là tiếp tục từ chỗ dừng, không tốn tiền dịch lại
+---
+
+### Điểm nổi bật
+
+- **Đa định dạng đầu vào**: Hỗ trợ `.epub`, `.pdf` (bao gồm cả PDF văn bản và PDF trang scan — tự động OCR bằng LLM Vision không cần cài Tesseract).
+- **Đầu ra chuẩn EPUB3**: Giữ nguyên hình ảnh, trang bìa tiêu chuẩn (EPUB2 + EPUB3), mục lục điều hướng phân cấp (nav + ncx) và font chữ tiếng Việt hiển thị đẹp mắt trên Apple Books, Kindle, Kobo.
+- **Cấu trúc tóm tắt đa chiều**: Mỗi bài học đi qua chuỗi phân tích nhân quả (*reasoning*), bóc tách bối cảnh, giới hạn áp dụng & giả định ngầm (*assumptions & limits*), kèm box *Góc nhìn thêm* đối chiếu triết lý tác giả với các học giả/chuyên gia khác.
+- **Ảnh bìa thông minh**: Kiểm duyệt ảnh bìa bằng LLM Vision để tránh tình trạng lấy nhầm trang scan mục lục/chữ li ti làm bìa sách (lỗi phổ biến khi convert qua Calibre).
+- **Cơ chế Cache thông minh**: Khi bị ngắt giữa chừng (Ctrl+C, mạng chập chờn), chỉ cần chạy lại là hệ thống tiếp tục từ điểm dừng, không tốn thêm chi phí LLM.
+
+---
 
 ## Cài đặt
 
-Yêu cầu Python 3.10+.
+Yêu cầu Python 3.10 trở lên.
 
-```powershell
-cd D:\Projects\ebook-shortform
-uv venv .venv                                          # hoặc: python -m venv .venv
-uv pip install -e . --python .venv\Scripts\python.exe  # hoặc: .venv\Scripts\pip install -e .
+### Trên macOS / Linux
+
+```bash
+git clone https://github.com/shinships/ebook-shortform.git
+cd ebook-shortform
+
+# Tạo virtual environment và kích hoạt
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Cài đặt gói ở chế độ editable
+pip install -e .
+
+# Tạo file cấu hình môi trường
+cp .env.example .env
 ```
 
-## Chọn backend LLM
-
-Tool tự động chọn backend theo thứ tự ưu tiên dựa trên biến môi trường và flags. Chỉ cần set **1 biến** là đủ:
-
-### Cách 1 — Gemini API key (đơn giản nhất)
-
-Lấy key miễn phí tại [aistudio.google.com](https://aistudio.google.com/apikey), model mặc định `gemini-2.5-flash`:
+### Trên Windows (PowerShell)
 
 ```powershell
-$env:GEMINI_API_KEY = "<api-key>"
+git clone https://github.com/shinships/ebook-shortform.git
+cd ebook-shortform
 
-.\.venv\Scripts\ebook-translate.exe sach.epub
-.\.venv\Scripts\ebook-summarize.exe sach.epub
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+pip install -e .
+Copy-Item .env.example .env
 ```
 
-Muốn model mạnh hơn:
-```powershell
-.\.venv\Scripts\ebook-summarize.exe sach.epub --model gemini-2.5-pro
+---
+
+## Cấu hình Backend LLM & Telegram
+
+Bạn có thể cấu hình các biến môi trường trực tiếp trong file `.env` hoặc export ra terminal. Tool tự động nhận diện theo thứ tự ưu tiên:
+
+### 1. Cấu hình file `.env` (Khuyến nghị)
+
+Mở file `.env` và điền các thông tin bạn có:
+
+```bash
+# LLM Backend API Keys (chỉ cần ít nhất 1 backend)
+GEMINI_API_KEY="your_gemini_api_key"
+ANTHROPIC_API_KEY="your_claude_api_key"
+GOOGLE_CLOUD_PROJECT="your_gcp_project_id"
+
+# Telegram Bot (tùy chọn - để gửi file tự động sau khi tóm tắt)
+TELEGRAM_BOT_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
+TELEGRAM_CHAT_ID="-100xxxxxxxxxx"
+TELEGRAM_TOPIC_ID="365"   # ID của Topic trong Forum Group (nếu có)
 ```
 
-### Cách 2 — Anthropic API key (Claude)
+### 2. Các tùy chọn Backend LLM
 
-Lấy key tại [console.anthropic.com](https://console.anthropic.com), model mặc định `claude-sonnet-4-20250514`:
-
-```powershell
-$env:ANTHROPIC_API_KEY = "<api-key>"
-
-.\.venv\Scripts\ebook-summarize.exe sach.epub
-# hoặc ép dùng Claude khi có cả GEMINI_API_KEY:
-.\.venv\Scripts\ebook-summarize.exe sach.epub --anthropic
-```
-
-Muốn dùng Opus:
-```powershell
-.\.venv\Scripts\ebook-summarize.exe sach.epub --anthropic --model claude-opus-4-20250514
-```
-
-### Cách 3 — Google Cloud Vertex AI
-
-Cho team/enterprise, model mặc định `gemini-3.6-flash`:
-
-```powershell
-gcloud auth application-default login              # đăng nhập GCP (một lần)
-$env:GOOGLE_CLOUD_PROJECT = "<gcp-project-id>"     # hoặc dùng --project
-
-.\.venv\Scripts\ebook-translate.exe sach.epub
-.\.venv\Scripts\ebook-summarize.exe sach.epub --model gemini-2.5-pro   # muốn model mạnh hơn
-```
-
-Yêu cầu: GCP project đã bật Vertex AI API và tài khoản có role `Vertex AI User`. Region mặc định `global` — **`gemini-3.6-flash` chỉ có ở `global`**, đổi `--region` chỉ khi dùng model khác (vd `gemini-2.5-pro`, `gemini-2.5-flash` có ở cả `us-central1`).
-
-**Lưu ý về xác thực**:
-
-- ADC (`gcloud auth application-default login`) là đăng nhập **riêng**, không tự đổi theo `gcloud auth login`.
-- Biến môi trường `GOOGLE_APPLICATION_CREDENTIALS` (nếu công cụ khác đặt) vốn **đứng đầu** thứ tự ưu tiên của Google và sẽ vô hiệu hoá ADC. Tool tự bỏ qua biến này khi máy đã có gcloud login, và in một dòng thông báo — nên không cần gỡ biến đó.
-- Nếu vẫn gặp 403: kiểm tra tài khoản trong ADC có role `Vertex AI User` trên project không.
-
-### Cách 4 — Proxy vertex-key (legacy)
-
-Flag `--proxy`, model `aws/claude-sonnet-5-medium` — đặt key vào biến `VERTEX_KEY_API_KEY`:
-
-```powershell
-$env:VERTEX_KEY_API_KEY = "<vertex-key api key>"
-.\.venv\Scripts\ebook-translate.exe sach.epub --proxy
-```
-
-### Thứ tự ưu tiên tự động
-
-| Ưu tiên | Điều kiện | Backend | Model mặc định |
+| Backend | Biến môi trường / Cấu hình | Model mặc định | Ghi chú |
 |---|---|---|---|
-| 1 | `--proxy` | Proxy vertex-key | `aws/claude-sonnet-5-medium` |
-| 2 | `--anthropic` hoặc `ANTHROPIC_API_KEY` | Anthropic API | `claude-sonnet-4-20250514` |
-| 3 | `GEMINI_API_KEY` hoặc `GOOGLE_API_KEY` | Google AI Studio | `gemini-2.5-flash` |
-| 4 | `--project` hoặc `GOOGLE_CLOUD_PROJECT` | Vertex AI (GCP) | `gemini-3.6-flash` |
+| **Google AI Studio** | `GEMINI_API_KEY` | `gemini-2.5-flash` | Đơn giản, miễn phí hạn mức cao tại [aistudio.google.com](https://aistudio.google.com/apikey). |
+| **Anthropic (Claude)** | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` | Chất lượng văn phong xuất sắc, lấy key tại [console.anthropic.com](https://console.anthropic.com). |
+| **Google Cloud Vertex AI** | `GOOGLE_CLOUD_PROJECT` | `gemini-3.6-flash` | Cho enterprise/GCP. Cần `gcloud auth application-default login`. Region mặc định `global`. |
+| **Proxy vertex-key** | `VERTEX_KEY_API_KEY` (dùng cờ `--proxy`) | `aws/claude-sonnet-5-medium` | Chế độ proxy nội bộ legacy. |
+
+---
 
 ## Sử dụng
 
-```powershell
-.\.venv\Scripts\ebook-translate.exe sach.epub
-# -> tạo sach.vi.epub và sach.vi.glossary.json
+### 1. Dịch Ebook (`ebook-translate`)
+
+Dịch toàn bộ cuốn sách từ tiếng Anh sang tiếng Việt:
+
+```bash
+ebook-translate sach.epub
+# -> Tạo sach.vi.epub và sach.vi.glossary.json
 ```
 
-Nên **dịch thử 1-2 chương trước** để duyệt văn phong rồi mới dịch cả cuốn:
+**Mẹo**: Nên dịch thử 1–2 chương đầu để duyệt văn phong và glossary trước khi chạy cả cuốn:
 
-```powershell
-.\.venv\Scripts\ebook-translate.exe sach.pdf --max-chapters 2
+```bash
+ebook-translate sach.pdf --max-chapters 2
 ```
 
-Các tuỳ chọn:
+Các cờ tùy chọn phổ biến:
+- `-o output.epub`: Chỉ định đường dẫn file đầu ra.
+- `--model <id>`: Chỉ định model LLM (ví dụ: `gemini-2.5-pro`, `claude-opus-4-20250514`).
+- `--glossary file.json`: Sử dụng bảng thuật ngữ có sẵn thay vì để LLM tự trích xuất.
+- `--cover bia.jpg`: Chỉ định ảnh bìa riêng.
+- `--keep-workdir`: Giữ lại thư mục cache tạm `*.workdir` sau khi xuất bản.
 
-| Tuỳ chọn | Ý nghĩa |
-|---|---|
-| `-o output.epub` | Đường dẫn file ra (mặc định `<input>.vi.epub`) |
-| `--model <id>` | Model LLM (mặc định tự chọn theo backend) |
-| `--anthropic` | Dùng Anthropic API trực tiếp (cần `ANTHROPIC_API_KEY`) |
-| `--project <id>` | GCP project ID cho Vertex AI |
-| `--region <region>` | Region Vertex AI, mặc định `global` |
-| `--proxy` | Dùng proxy vertex-key (legacy, cần `VERTEX_KEY_API_KEY`) |
-| `--base-url <url>` | Base URL proxy, chỉ dùng kèm `--proxy` |
-| `--glossary file.json` | Dùng glossary có sẵn thay vì tự xây |
-| `--cover anh.jpg` | Ảnh bìa tự chọn (xem [Ảnh bìa](#ảnh-bìa)) |
-| `--max-chapters N` | Chỉ dịch N chương đầu (dịch thử) |
-| `--keep-workdir` | Giữ thư mục cache `<output>.workdir` sau khi xong |
+---
 
-## Tóm tắt chuyên sâu (`ebook-summarize`)
+### 2. Tóm tắt chuyên sâu (`ebook-summarize`)
 
-```powershell
-.\.venv\Scripts\ebook-summarize.exe sach.epub
-# -> tạo sach_short.epub và sach_short.analysis.json
+Biến một cuốn sách dày cộp thành bộ microlearning chuyên sâu:
+
+```bash
+ebook-summarize sach.epub
+# -> Tạo sach_short.epub và sach_short.analysis.json
 ```
 
-Cấu trúc sách tóm tắt:
+#### Cấu trúc một cuốn sách tóm tắt Shortform:
+1. **"Về cuốn sách này"**: Giới thiệu bối cảnh tác phẩm + **Tóm tắt 1 trang** (nắm toàn cảnh trước khi học từng bài).
+2. **Các bài học chuyên sâu** (2.400–4.000 từ / bài, đọc trong 15–25 phút):
+   - **Vì sao phần này quan trọng**: Đặt vấn đề và tính cấp thiết.
+   - **Cơ chế hoạt động & Case studies**: Phân tích cặn kẽ logic vận hành, số liệu, bài học thực tế từ sách gốc.
+   - **Góc nhìn thêm (Commentary)**: Hộp bình luận mở rộng, đối chiếu kiến thức của tác giả với các trường phái/tác phẩm kinh điển khác hoặc góc nhìn thị trường hiện đại.
+   - **Giới hạn giả định & Phản biện (Assumptions & Limits)**: Những bối cảnh mà lời khuyên của tác giả có thể không còn phù hợp.
+   - **Điểm cốt lõi**: Tóm tắt 3-5 ý đắt giá nhất.
+   - **Bài tập thực hành**: 2–3 câu hỏi tự vấn phản tư + 1 hành động hành vi có thể làm ngay.
+3. **"Tổng kết"**: Xâu chuỗi toàn bộ cuốn sách thành một hệ thống tư duy mạch lạc.
 
-- **"Về cuốn sách này"** mở đầu: giới thiệu + **Tóm tắt 1 trang** (nắm bức tranh lớn trước khi vào từng bài).
-- **Mỗi bài học** (2.400–4.000 từ, ≈ 15–25 phút): vì sao phần này quan trọng → từng mục giải thích cơ chế với ví dụ từ sách → box *Góc nhìn thêm* (bình luận từ kiến thức ngoài sách, tách bạch rõ) → box *Điểm chính* → box *Thực hành* (2–3 câu hỏi tự vấn + 1 hành động cụ thể).
-- **"Tổng kết"** cuối sách: xâu chuỗi toàn bộ + nhìn lại mọi điểm chính.
-- **Bìa**: dùng lại nguyên bản ảnh bìa gốc của sách, đặt làm trang bìa chuẩn (EPUB2 + EPUB3) để hiển thị đúng trên mọi reader. Xem mục [Ảnh bìa](#ảnh-bìa).
-
-Chương gốc quá ngắn được gộp, quá dài được tách nhiều bài (chương rất dài đi qua bước trích notes từng đoạn trước khi viết bài). Trang bìa/mục lục/bản quyền/index tự bị bỏ qua — có thể sửa lại trong `*.analysis.json` rồi chạy lại.
-
-Nên **chạy thử trước**: `--max-lessons 2 --keep-workdir` để duyệt văn phong (bài đã sinh được cache, chạy full không tốn lại).
-
-Các tuỳ chọn riêng (các flag `--model`, `--anthropic`, `--project`, `--region`, `--proxy` dùng chung như `ebook-translate`):
-
-| Tuỳ chọn | Ý nghĩa |
-|---|---|
-| `-o output.epub` | File ra (mặc định `<input>_short.epub`) |
-| `--cover anh.jpg` | Ảnh bìa tự chọn (xem [Ảnh bìa](#ảnh-bìa)) |
-| `--analysis file.json` | Dùng analysis có sẵn thay vì tự phân tích |
-| `--max-lessons N` | Chỉ sinh N bài đầu (chạy thử; bỏ bài mở đầu/tổng kết) |
-
-## Ảnh bìa
-
-Mặc định tool dùng lại **ảnh bìa gốc** của sách. Nhưng nhiều EPUB do calibre
-convert khai báo bìa sai: khi sách gốc không có bìa thật, calibre lấy đại ảnh
-đầu tiên trong manifest — thường là một **trang scan nội dung** (index, mục lục,
-hình minh hoạ). Sách xuất ra khi đó có "bìa" là một trang chữ li ti.
-
-Nên trước khi nhúng, tool gửi ảnh bìa qua **LLM vision** hỏi xem nó có thật sự
-là bìa sách không (một request nhỏ, kết quả được cache theo nội dung ảnh nên
-chạy lại không tốn thêm). Nếu không đạt, bìa bị bỏ kèm cảnh báo.
-
-Muốn có bìa đúng, tải ảnh bìa sách rồi truyền vào — khi có `--cover` thì bỏ qua
-bước kiểm tra:
-
-```powershell
-.\.venv\Scripts\ebook-summarize.exe sach.epub --cover bia.jpg
+#### Chạy thử tóm tắt:
+```bash
+ebook-summarize sach.epub --max-lessons 2 --keep-workdir
 ```
 
-Nhận `.jpg`, `.png`, `.gif`, `.webp`; định dạng ngoài chuẩn EPUB3 (vd webp) được
-tự chuyển sang JPEG cho tương thích reader. Cả `ebook-translate` lẫn
-`ebook-summarize` đều có flag này.
+---
 
-## Quy trình bên trong
+## Tự động hóa Pipeline & Telegram
 
-1. **Đọc file gốc** → chương (HTML) + ảnh + mục lục. PDF: chia chương theo bookmark; không có bookmark thì dựa vào cỡ chữ heading. Trang scan được render ảnh và OCR bằng LLM vision.
-2. **Xây glossary**: lấy mẫu ~15% nội dung, LLM liệt kê tên riêng/thuật ngữ lặp lại và chốt cách dịch → ghi `*.glossary.json`. **Có thể mở file này sửa cách dịch thuật ngữ rồi chạy lại** (bản dịch cũ tự mất hiệu lực vì cache gắn với phiên bản glossary).
-3. **Dịch tiêu đề**: toàn bộ tiêu đề chương + mục lục dịch trong một request duy nhất → mục lục và tiêu đề trong bài luôn khớp nhau.
-4. **Dịch nội dung**: cắt chương thành đoạn ~3000 token theo ranh giới đoạn văn; mỗi request kèm glossary + phần cuối bản dịch trước đó để mạch văn liền; giữ nguyên tag HTML, không dịch `<code>/<pre>`; kiểm tra cấu trúc HTML sau dịch, lệch thì tự dịch lại.
-5. **Xuất EPUB3**: ảnh gốc nhúng nguyên trạng, mục lục nav + NCX, `dc:language = vi`, giữ tựa gốc làm metadata phụ.
+### 1. Dây chuyền tự động (`auto-pipeline.sh`)
 
-Kết thúc, tool in tổng token vào/ra để ước lượng chi phí.
+Script Bash tự động hóa hoàn toàn quy trình xử lý hàng loạt sách:
+
+```
+[inbox/] ───► [processing/] ───► [output/] ───► [Telegram Group / Topic]
+                     ▲                │
+                     │                └───► [output/originals/] (Lưu trữ bản gốc)
+                     └─── Cache workdir (tự khôi phục nếu lỗi)
+```
+
+**Cách sử dụng**:
+1. Copy các file sách (`.epub`, `.pdf`) vào thư mục `inbox/`.
+2. Khởi chạy pipeline:
+   ```bash
+   ./auto-pipeline.sh
+   ```
+3. Các cờ bổ sung:
+   ```bash
+   ./auto-pipeline.sh --model gemini-2.5-pro    # Dùng Gemini Pro
+   ./auto-pipeline.sh --anthropic              # Dùng Claude
+   ./auto-pipeline.sh --dry-run                # Chỉ xem danh sách file cần xử lý
+   ```
+4. Sau khi hoàn thành, file `.epub` tóm tắt sẽ nằm tại `output/`, bản gốc được chuyển sang `output/originals/`, nhật ký ghi lại ở `logs/YYYY-MM-DD.md`, và file tự động được gửi tới Telegram Topic nếu cấu hình `.env`.
+
+---
+
+### 2. Gửi file tới Telegram (`scripts/send_to_telegram.py`)
+
+Công cụ dòng lệnh tiện ích dùng để gửi file EPUB hoặc tài liệu tới nhóm Telegram qua Bot API, hỗ trợ cả Telegram Forum Topics:
+
+```bash
+# Gửi 1 hoặc nhiều file (lấy token và chat id từ .env)
+python scripts/send_to_telegram.py output/sach_short.epub
+
+# Gửi kèm caption định dạng HTML
+python scripts/send_to_telegram.py output/sach_short.epub \
+    --caption "📚 <b>Tên Sách</b>\nTóm tắt chuyên sâu kiểu Shortform"
+
+# Tùy biến trực tiếp tham số (không cần .env)
+python scripts/send_to_telegram.py output/sach_short.epub \
+    --token "YOUR_BOT_TOKEN" \
+    --chat-id "-100xxxxxxxxxx" \
+    --topic-id "365"
+```
+
+---
+
+### 3. Bộ tóm tắt chuyên sâu Philip Fisher (`scripts/generate_fisher_summaries.py`)
+
+Kịch bản chuyên biệt tạo trọn bộ sách tóm tắt chuyên sâu về triết lý đầu tư tăng trưởng của **Philip A. Fisher**:
+
+- **Cuốn 1**: *Common Stocks and Uncommon Profits and Other Writings* (Cổ phiếu thường, Lợi nhuận phi thường) — 8 bài học chuyên sâu (15 tiêu chí chọn cổ phiếu tăng trưởng, phương pháp Lời đồn đại - Scuttlebutt, 5 quy tắc khi mua, khi nào nên bán và khi nào không nên bán...).
+- **Cuốn 2**: *Paths to Wealth Through Common Stocks* (Những con đường dẫn đến của cải qua cổ phiếu thường) — 7 bài học chuyên sâu (vai trò R&D, lạm phát và sức mua dài hạn, phân biệt đầu cơ và đầu tư, tìm kiếm công ty tăng trưởng vượt bậc...).
+- **Tuyển tập Master Omnibus**: Kết hợp toàn diện cả 2 tác phẩm thành một cuốn bách khoa toàn thư duy nhất về Đầu tư Tăng trưởng, bổ sung ảnh bìa nghệ thuật chất lượng cao, đối chiếu sâu sắc với Warren Buffett ("85% Graham & 15% Fisher"), Charlie Munger, Peter Lynch, Benjamin Graham và thị trường chứng khoán Việt Nam.
+
+**Khởi chạy**:
+```bash
+python scripts/generate_fisher_summaries.py
+```
+*(Script tự động sinh các file EPUB tại `output/`, lưu cache tại `workdir_fisher/` và gửi thẳng lên Telegram Topic sau khi hoàn tất).*
+
+---
+
+## Ảnh bìa & Xử lý hình ảnh
+
+- **Kiểm định bằng LLM Vision**: Nhiều file EPUB trích xuất từ Calibre thường lấy nhầm một trang scan mục lục hoặc hình ảnh nhỏ đầu trang làm ảnh bìa. Tool tự động gửi ảnh bìa qua LLM Vision để thẩm định tính xác thực. Nếu ảnh không phải là bìa sách thật, tool sẽ bỏ qua để tránh xuất ra ebook có trang bìa xấu.
+- **Chỉ định bìa ngoài**: Sử dụng cờ `--cover anh_bia.jpg` (hỗ trợ `.jpg`, `.png`, `.webp`, `.gif` — tự động chuyển đổi sang JPEG chuẩn EPUB3).
+
+---
 
 ## Cấu trúc mã nguồn
 
 ```
-src\ebook_translator\
-├── cli.py                  # điều phối pipeline dịch (ebook-translate)
-├── cli_summarize.py        # điều phối pipeline tóm tắt (ebook-summarize)
-├── models.py               # Book / Chapter / ImageAsset / TocEntry
-├── readers\
-│   ├── loader.py           # dispatch epub/pdf + OCR (dùng chung 2 lệnh)
-│   ├── epub_reader.py      # EPUB -> Book
-│   ├── pdf_reader.py       # PDF text -> Book (PyMuPDF)
-│   └── ocr.py              # phát hiện trang scan + OCR bằng LLM vision
-├── core\
-│   ├── cover.py            # xác thực ảnh bìa (LLM vision) + xử lý --cover
-│   ├── segmenter.py        # cắt HTML thành chunk
-│   ├── glossary.py         # xây/quản lý glossary EN->VI
-│   ├── translator.py       # dịch nội dung + tiêu đề
-│   ├── summarizer.py       # phân tích sách + chia bài + viết guide kiểu Shortform
-│   ├── cache.py            # cache chunk/bài đã sinh (resume)
-│   └── llm.py              # wrapper Gemini/Anthropic API (retry, đếm token)
-└── writers\
-    └── epub_writer.py      # Book -> EPUB3
+ebook-shortform/
+├── auto-pipeline.sh                # Script Bash điều phối dây chuyền tự động
+├── pyproject.toml                  # Khai báo dependency và CLI entrypoints
+├── .env.example                    # File mẫu cấu hình biến môi trường & Telegram
+├── inbox/                          # Thư mục chứa sách đầu vào chờ xử lý
+├── processing/                     # Thư mục xử lý tạm thời kèm cache
+├── output/                         # Thư mục chứa file EPUB tóm tắt hoàn chỉnh
+│   └── originals/                  # Lưu trữ file sách gốc đã xử lý
+├── logs/                           # Nhật ký xử lý theo ngày (Markdown)
+├── covers/                         # Thư mục lưu trữ ảnh bìa tùy chỉnh
+├── scripts/
+│   ├── send_to_telegram.py         # Utility gửi tài liệu tới Telegram Topic qua Bot API
+│   └── generate_fisher_summaries.py # Pipeline tóm tắt bộ tác phẩm Philip Fisher
+└── src/
+    └── ebook_translator/
+        ├── cli.py                  # CLI dịch thuật (ebook-translate)
+        ├── cli_summarize.py        # CLI tóm tắt Shortform (ebook-summarize)
+        ├── models.py               # Data models: Book, Chapter, ImageAsset, TocEntry
+        ├── readers/
+        │   ├── loader.py           # Bộ nạp tập trung cho EPUB và PDF
+        │   ├── epub_reader.py      # Trích xuất cấu trúc EPUB
+        │   ├── pdf_reader.py       # Trích xuất PDF text & bookmark (PyMuPDF)
+        │   └── ocr.py              # Nhận diện trang scan và OCR bằng LLM Vision
+        ├── core/
+        │   ├── cover.py            # Thẩm định & chuẩn hóa ảnh bìa sách
+        │   ├── segmenter.py        # Chia cắt nội dung thành các chunk dịch logic
+        │   ├── glossary.py         # Xây dựng và quản lý từ điển thuật ngữ EN -> VI
+        │   ├── translator.py       # Dịch nội dung và tiêu đề mục lục
+        │   ├── summarizer.py       # Phân tích, chia bài và biên soạn Shortform
+        │   ├── cache.py            # Quản lý bộ nhớ đệm tiếp tục công việc
+        │   └── llm.py              # Client tích hợp Gemini, Anthropic, Vertex AI
+        └── writers/
+            └── epub_writer.py      # Đóng gói và xuất file chuẩn EPUB3
 ```
+
+---
+
+## License
+
+Phát triển bởi đội ngũ và đóng góp cộng đồng. Mã nguồn phát hành dưới giấy phép MIT.
