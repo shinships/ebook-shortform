@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mktmda.ebook-telegram-bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mktmda/Projects/ebook-shortform/.venv-mac/bin/python</string>
+        <string>-u</string>
+        <string>/Users/mktmda/Projects/ebook-shortform/scripts/telegram_inbound_bot.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mktmda/Projects/ebook-shortform</string>
+
+    <!-- Chạy liên tục ngầm 24/7, tự bật lại nếu lỗi -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Tự kích hoạt khi đăng nhập máy Mac -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Nhật ký chạy ngầm -->
+    <key>StandardOutPath</key>
+    <string>/Users/mktmda/Projects/ebook-shortform/logs/telegram_bot.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mktmda/Projects/ebook-shortform/logs/telegram_bot.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>

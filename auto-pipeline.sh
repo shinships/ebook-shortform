@@ -37,12 +37,15 @@ fi
 
 # ── Parse arguments ─────────────────────────────────────────────────────────
 DRY_RUN=false
+NO_TELEGRAM=false
 EXTRA_ARGS=()
 SPECIFIC_FILES=()
 
 for arg in "$@"; do
     if [[ "$arg" == "--dry-run" ]]; then
         DRY_RUN=true
+    elif [[ "$arg" == "--no-telegram" ]]; then
+        NO_TELEGRAM=true
     elif [[ -f "$arg" ]]; then
         SPECIFIC_FILES+=("$arg")
     else
@@ -201,8 +204,8 @@ for filepath in "${FILES[@]}"; do
         echo "   → $OUTPUT/${stem}_short.epub"
         echo ""
 
-        # Gửi tới Telegram nếu có cấu hình trong .env hoặc env vars
-        if [[ -f "$PROJECT_DIR/scripts/send_to_telegram.py" ]]; then
+        # Gửi tới Telegram nếu có cấu hình trong .env hoặc env vars (và không tắt bằng --no-telegram)
+        if ! $NO_TELEGRAM && [[ -f "$PROJECT_DIR/scripts/send_to_telegram.py" ]]; then
             echo "   📤 Đang gửi file tới Telegram..."
             "$VENV_BIN/python" "$PROJECT_DIR/scripts/send_to_telegram.py" "$OUTPUT/${stem}_short.epub" \
                 --caption "📚 <b>${stem}</b> (Tóm tắt chuyên sâu kiểu Shortform)" || true

@@ -25,6 +25,7 @@ lessons_output/
 /Tom-tat_*.md
 /Jason*.md
 /Jason*.epub
+/*_short.md
 /input.*
 
 # Pipeline runtime contents (folders tracked via .gitkeep)

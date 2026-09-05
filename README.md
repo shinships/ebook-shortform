@@ -177,17 +177,47 @@ python scripts/send_to_telegram.py output/sach_short.epub
 # Gửi kèm caption định dạng HTML
 python scripts/send_to_telegram.py output/sach_short.epub \
     --caption "📚 <b>Tên Sách</b>\nTóm tắt chuyên sâu kiểu Shortform"
-
-# Tùy biến trực tiếp tham số (không cần .env)
-python scripts/send_to_telegram.py output/sach_short.epub \
-    --token "YOUR_BOT_TOKEN" \
-    --chat-id "-100xxxxxxxxxx" \
-    --topic-id "365"
 ```
 
 ---
 
-### 3. Bộ tóm tắt chuyên sâu Philip Fisher (`scripts/generate_fisher_summaries.py`)
+### 3. Telegram Inbound Bot 2 chiều (`scripts/telegram_inbound_bot.py`)
+
+Dịch vụ chạy ngầm 24/7 trên macOS cho phép bạn **gửi sách trực tiếp từ điện thoại/iPad** qua Telegram (`@ebookshort_bot`) và nhận lại bản tóm tắt Shortform ngay tại khung chat.
+
+```bash
+# Quản lý dịch vụ bot ngầm (không cần mở Antigravity hay Terminal)
+./scripts/setup_schedule.sh bot-install    # Cài đặt và bật bot ngầm 24/7
+./scripts/setup_schedule.sh bot-status     # Xem trạng thái hoạt động
+./scripts/setup_schedule.sh bot-logs       # Xem log bot trực tiếp
+./scripts/setup_schedule.sh bot-uninstall  # Dừng bot
+
+# Quản lý chung cả lịch chạy 12:10 và bot:
+./scripts/setup_schedule.sh status         # Xem trạng thái tổng quan
+./scripts/setup_schedule.sh install-all    # Bật cả Lịch 12:10 & Bot 24/7
+```
+
+---
+
+### 4. Tạo Audio Podcast Tóm Tắt Sách (`scripts/generate_podcast.py`)
+
+Tự động biến tài liệu tóm tắt thành tập **Audio Podcast** tự nhiên, sống động bằng **Gemini AI + Vbee AIVoice TTS**:
+
+```bash
+# Tạo Podcast MP3 từ file tóm tắt và tự động gửi tới Telegram
+python scripts/generate_podcast.py Remote_Office_Not_Required_short.md --telegram
+
+# Tùy chọn giọng đọc (Ngọc Huyền, Mai Phương, Lan Trinh...):
+python scripts/generate_podcast.py Remote_Office_Not_Required_short.md --voice hn_female_maiphuong_vdts_48k-fhg
+
+# Chỉ tạo kịch bản văn bản (không gọi TTS):
+python scripts/generate_podcast.py Remote_Office_Not_Required_short.md --script-only
+```
+- **Output:** File kịch bản tại `output/podcasts/*_script.txt` và file audio tại `output/podcasts/*_podcast.mp3`.
+
+---
+
+### 5. Bộ tóm tắt chuyên sâu Philip Fisher (`scripts/generate_fisher_summaries.py`)
 
 Kịch bản chuyên biệt tạo trọn bộ sách tóm tắt chuyên sâu về triết lý đầu tư tăng trưởng của **Philip A. Fisher**:
 
