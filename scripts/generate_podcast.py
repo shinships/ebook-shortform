@@ -39,9 +39,9 @@ VBEE_TTS_URL = "https://vbee.vn/api/v1/tts"
 
 # Danh sách giọng đọc podcast tiêu biểu
 POPULAR_VOICES = {
+    "hn_female_maiphuong_vdts_48k-fhg": "HN - Mai Phương (Nữ Bắc, tự nhiên, nhẹ nhàng)",
     "hn_male_manhdung_news_48k-fhg": "HN - Mạnh Dũng (Nam Bắc, trang trọng, thời sự)",
     "hn_female_ngochuyen_full_48k-fhg": "HN - Ngọc Huyền (Nữ Bắc, truyền cảm, podcast)",
-    "hn_female_maiphuong_vdts_48k-fhg": "HN - Mai Phương (Nữ Bắc, tự nhiên, nhẹ nhàng)",
     "hn_male_thanhlong_talk_48k-fhg": "HN - Thanh Long (Nam Bắc, talkshow/đàm thoại)",
     "hn_male_phuthang_stor80dt_48k-fhg": "HN - Anh Khôi (Nam Bắc, trầm ấm, đọc truyện)",
     "hn_male_minhquan_yt-stable": "HN - Minh Quân (Nam Bắc, trẻ trung, review)",
@@ -54,12 +54,12 @@ POPULAR_VOICES = {
 }
 
 VOICE_ALIASES = {
+    "maiphuong": "hn_female_maiphuong_vdts_48k-fhg",
+    "mai phương": "hn_female_maiphuong_vdts_48k-fhg",
     "manhdung": "hn_male_manhdung_news_48k-fhg",
     "mạnh dũng": "hn_male_manhdung_news_48k-fhg",
     "ngochuyen": "hn_female_ngochuyen_full_48k-fhg",
     "ngọc huyền": "hn_female_ngochuyen_full_48k-fhg",
-    "maiphuong": "hn_female_maiphuong_vdts_48k-fhg",
-    "mai phương": "hn_female_maiphuong_vdts_48k-fhg",
     "thanhlong": "hn_male_thanhlong_talk_48k-fhg",
     "thanh long": "hn_male_thanhlong_talk_48k-fhg",
     "anhkhoi": "hn_male_phuthang_stor80dt_48k-fhg",
@@ -80,7 +80,28 @@ VOICE_ALIASES = {
     "duy phương": "hue_male_duyphuong_full_48k-fhg",
 }
 
-DEFAULT_FALLBACK_VOICE = "hn_male_manhdung_news_48k-fhg"
+DEFAULT_FALLBACK_VOICE = "hn_female_maiphuong_vdts_48k-fhg"
+
+VOICE_TO_READER_NAME = {
+    "hn_female_maiphuong_vdts_48k-fhg": "Mai Phương",
+    "hn_male_manhdung_news_48k-fhg": "Mạnh Dũng",
+    "hn_female_ngochuyen_full_48k-fhg": "Ngọc Huyền",
+    "hn_male_thanhlong_talk_48k-fhg": "Thanh Long",
+    "hn_male_phuthang_stor80dt_48k-fhg": "Anh Khôi",
+    "hn_male_minhquan_yt-stable": "Minh Quân",
+    "sg_female_lantrinh_vdts_48k-fhg": "Lan Trinh",
+    "sg_female_thaotrinh_full_48k-fhg": "Thảo Trinh",
+    "sg_male_trungkien_vdts_48k-fhg": "Trung Kiên",
+    "sg_male_minhhoang_full_48k-fhg": "Minh Hoàng",
+    "hue_female_huonggiang_full_48k-fhg": "Hương Giang",
+    "hue_male_duyphuong_full_48k-fhg": "Duy Phương",
+}
+
+
+def get_reader_name(voice_code: str | None = None) -> str:
+    """Lấy tên người đọc tương ứng với mã giọng."""
+    target_code = resolve_voice_code(voice_code)
+    return VOICE_TO_READER_NAME.get(target_code, "Mai Phương")
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -117,24 +138,27 @@ def resolve_voice_code(voice_input: str | None = None) -> str:
 DEFAULT_VOICE = resolve_voice_code()
 
 
-def generate_podcast_script(text: str, book_title: str) -> str:
+def generate_podcast_script(text: str, book_title: str, voice_code: str | None = None) -> str:
     """Sử dụng Gemini để chuyển nội dung tóm tắt thành kịch bản Podcast đàm thoại hấp dẫn."""
-    print("🧠 Đang dùng Gemini để biên soạn kịch bản Podcast lôi cuốn...")
+    reader_name = get_reader_name(voice_code)
+    print(f"🧠 Đang dùng Gemini để biên soạn kịch bản Podcast với người dẫn chuyện [{reader_name}]...")
     llm = LLMClient()
 
     system_prompt = (
-        "Bạn là một Podcast Producer và Host chuyên nghiệp hàng đầu về sách kinh doanh, phát triển bản thân và tư duy. "
-        "Nhiệm vụ của bạn là chuyển đổi bản tóm tắt sách thành một KỊCH BẢN NÓI ĐƠN THOẠI (SOLO PODCAST SCRIPT) kéo dài khoảng 8-12 phút nghe (tầm 2.500 - 3.500 ký tự).\n\n"
-        "Nguyên tắc biên kịch Podcast:\n"
-        "1. VĂN NÓI TỰ NHIÊN: Sử dụng văn phong gần gũi, xưng hô 'tôi' và 'các bạn' hoặc 'bạn'. Có nhịp thở, câu cảm thán, câu hỏi tu từ.\n"
-        "2. HOOK MỞ ĐẦU: Bắt đầu bằng một câu hỏi gợi mở, một nghịch lý hoặc câu chuyện gây tò mò thay vì đọc tiêu đề khô khan.\n"
-        "3. ĐIỂM CHẠM THỰC TẾ: Không đọc danh sách gạch đầu dòng; hãy xâu chuỗi các ý tưởng thành một câu chuyện có dòng chảy mạch lạc.\n"
-        "4. KẾT THÚC HÀNH ĐỘNG: Đúc kết 1-2 hành vi cụ thể có thể làm ngay hôm nay kèm lời chào ấm áp, truyền cảm hứng.\n"
-        "5. ĐỊNH DẠNG ĐẦU RA: CHỈ XUẤT VĂN BẢN THUẦN ĐỂ ĐỌC (Plain text), không chứa các ký tự định dạng sân khấu như [Nhạc nền], [Cười], (Host nói:), **in đậm** hay # markdown."
+        f"Bạn là một Podcast Producer và Host chuyên nghiệp hàng đầu về sách kinh doanh, phát triển bản thân và tư duy.\n"
+        f"Tên của bạn (Host / Người dẫn chương trình) là: {reader_name}.\n"
+        f"Nhiệm vụ của bạn là chuyển đổi bản tóm tắt sách thành một KỊCH BẢN NÓI ĐƠN THOẠI (SOLO PODCAST SCRIPT) kéo dài khoảng 8-12 phút nghe (tầm 2.500 - 3.500 ký tự).\n\n"
+        f"Nguyên tắc biên kịch Podcast:\n"
+        f"1. VĂN NÓI TỰ NHIÊN & GIỚI THIỆU TÊN: Sử dụng văn phong gần gũi, xưng hô 'tôi là {reader_name}' và 'các bạn' hoặc 'bạn'. Có nhịp thở, câu cảm thán, câu hỏi tu từ. Ngay phần mở đầu hãy giới thiệu tên mình một cách tự nhiên (ví dụ: 'Chào mừng các bạn đã quay trở lại... Tôi là {reader_name}...'). Ở phần kết thúc cũng nhắc lại tên ({reader_name}) và chào tạm biệt.\n"
+        f"2. BÁM SÁT NỘI DUNG SÁCH: Tập trung 100% vào nội dung cốt lõi của cuốn sách '{book_title}' và các bài học trong tài liệu. Tuyệt đối KHÔNG đưa vào các ví dụ lạc đề không liên quan (chẳng hạn như AI đặt lịch, CSKH phòng khám...).\n"
+        f"3. HOOK MỞ ĐẦU: Bắt đầu bằng một câu hỏi gợi mở, một nghịch lý hoặc câu chuyện gây tò mò thay vì đọc tiêu đề khô khan.\n"
+        f"4. ĐIỂM CHẠM THỰC TẾ: Không đọc danh sách gạch đầu dòng; hãy xâu chuỗi các ý tưởng thành một câu chuyện có dòng chảy mạch lạc.\n"
+        f"5. KẾT THÚC HÀNH ĐỘNG: Đúc kết 1-2 hành vi cụ thể có thể làm ngay hôm nay kèm lời chào ấm áp, truyền cảm hứng từ {reader_name}.\n"
+        f"6. ĐỊNH DẠNG ĐẦU RA: CHỈ XUẤT VĂN BẢN THUẦN ĐỂ ĐỌC (Plain text), không chứa các ký tự định dạng sân khấu như [Nhạc nền], [Cười], (Host nói:), **in đậm** hay # markdown."
     )
 
     prompt = (
-        f"Hãy chuyển đổi tài liệu tóm tắt sau của cuốn sách '{book_title}' thành một kịch bản Podcast hoàn chỉnh để máy đọc bằng giọng nói:\n\n"
+        f"Hãy chuyển đổi tài liệu tóm tắt sau của cuốn sách '{book_title}' thành một kịch bản Podcast hoàn chỉnh để máy đọc bằng giọng nói của Host {reader_name}:\n\n"
         f"{text[:12000]}"
     )
 
@@ -264,13 +288,14 @@ def create_podcast_for_book(
 
     target_voice = resolve_voice_code(voice)
     voice_desc = POPULAR_VOICES.get(target_voice, target_voice)
-    print(f"🎙️ Giọng đọc được chọn: {voice_desc} (Mã: {target_voice})")
+    reader_name = get_reader_name(target_voice)
+    print(f"🎙️ Giọng đọc được chọn: {voice_desc} (Mã: {target_voice}, Người đọc: {reader_name})")
 
     stem = input_path.stem
     PODCASTS_DIR.mkdir(parents=True, exist_ok=True)
 
     content = extract_text_from_file(input_path)
-    script = generate_podcast_script(content, book_title=stem)
+    script = generate_podcast_script(content, book_title=stem, voice_code=target_voice)
     script_file = PODCASTS_DIR / f"{stem}_podcast_script.txt"
     script_file.write_text(script, encoding="utf-8")
     print(f"📝 Đã lưu kịch bản Podcast tại: {script_file}")
@@ -289,7 +314,10 @@ def create_podcast_for_book(
         if send_telegram:
             telegram_script = PROJECT_DIR / "scripts" / "send_to_telegram.py"
             if telegram_script.exists():
-                caption = f"🎙️ <b>Podcast Tóm Tắt: {stem}</b>\n✨ <i>Giọng đọc AI: {voice_desc}</i>"
+                caption = (
+                    f"🎙️ <b>Podcast Tóm Tắt: {stem}</b>\n"
+                    f"🗣️ <b>Người đọc:</b> {reader_name} (AI Vbee - 128kbps)"
+                )
                 subprocess.run([sys.executable, str(telegram_script), str(output_mp3), "--caption", caption])
         return output_mp3
     return None
@@ -305,7 +333,7 @@ def print_available_voices():
         print(f"• {code:35} -> {desc}{is_cur}")
     print("=" * 75)
     print(f"💡 Cấu hình giọng mặc định lâu dài: Thêm vào file .env:")
-    print(f"   VBEE_VOICE=\"hn_male_manhdung_news_48k-fhg\"\n")
+    print(f"   VBEE_VOICE=\"hn_female_maiphuong_vdts_48k-fhg\"\n")
 
 
 def main():
@@ -331,6 +359,9 @@ def main():
     if not input_path.exists():
         sys.exit(f"❌ Không tìm thấy file: {input_path}")
 
+    target_voice = resolve_voice_code(args.voice)
+    reader_name = get_reader_name(target_voice)
+    voice_desc = POPULAR_VOICES.get(target_voice, target_voice)
     stem = input_path.stem
     PODCASTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -340,7 +371,7 @@ def main():
         print(f"📄 Sử dụng kịch bản có sẵn từ: {args.use_existing_script}")
     else:
         content = extract_text_from_file(input_path)
-        script = generate_podcast_script(content, book_title=stem)
+        script = generate_podcast_script(content, book_title=stem, voice_code=target_voice)
         script_file = PODCASTS_DIR / f"{stem}_podcast_script.txt"
         script_file.write_text(script, encoding="utf-8")
         print(f"📝 Đã lưu kịch bản Podcast tại: {script_file}")
@@ -362,7 +393,7 @@ def main():
         output_path=output_mp3,
         app_id=app_id,
         token=token,
-        voice_code=args.voice,
+        voice_code=target_voice,
         speed=args.speed,
     )
 
@@ -371,7 +402,10 @@ def main():
         print("📤 Đang gửi Podcast MP3 tới Telegram Topic...")
         telegram_script = PROJECT_DIR / "scripts" / "send_to_telegram.py"
         if telegram_script.exists():
-            caption = f"🎙️ <b>Podcast Tóm Tắt: {stem}</b>\n✨ <i>Giọng đọc AI Vbee tự nhiên (128kbps)</i>"
+            caption = (
+                f"🎙️ <b>Podcast Tóm Tắt: {stem}</b>\n"
+                f"🗣️ <b>Người đọc:</b> {reader_name} (AI Vbee - 128kbps)"
+            )
             subprocess.run([sys.executable, str(telegram_script), str(output_mp3), "--caption", caption])
 
 

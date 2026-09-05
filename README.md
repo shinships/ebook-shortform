@@ -83,8 +83,8 @@ TELEGRAM_TOPIC_ID="365"   # ID của Topic trong Forum Group (nếu có)
 VBEE_APP_ID="your_vbee_app_id"
 VBEE_APP_NAME="ebook-short"
 VBEE_TOKEN="your_vbee_jwt_token"
-# Mã giọng đọc mặc định (Mặc định: hn_male_manhdung_news_48k-fhg - Mạnh Dũng)
-VBEE_VOICE="hn_male_manhdung_news_48k-fhg"
+# Mã giọng đọc mặc định (Mặc định: hn_female_maiphuong_vdts_48k-fhg - Mai Phương)
+VBEE_VOICE="hn_female_maiphuong_vdts_48k-fhg"
 ```
 
 ### 2. Các tùy chọn Backend LLM
@@ -255,9 +255,9 @@ python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub 
 
 | Tên ngắn (Alias) | Mã giọng Vbee (`voice_code`) | Vùng miền / Giới tính | Phong cách phù hợp |
 |:---|:---|:---|:---|
-| `manhdung` | `hn_male_manhdung_news_48k-fhg` | Nam - Miền Bắc *(Mặc định)* | Trang trọng, thời sự, sách kinh doanh |
+| `maiphuong` | `hn_female_maiphuong_vdts_48k-fhg` | Nữ - Miền Bắc *(Mặc định)* | Tự nhiên, nhẹ nhàng, đàm thoại, podcast |
+| `manhdung` | `hn_male_manhdung_news_48k-fhg` | Nam - Miền Bắc | Trang trọng, thời sự, sách kinh doanh |
 | `ngochuyen` | `hn_female_ngochuyen_full_48k-fhg` | Nữ - Miền Bắc | Truyền cảm, chuẩn mực sách nói / podcast |
-| `maiphuong` | `hn_female_maiphuong_vdts_48k-fhg` | Nữ - Miền Bắc | Tự nhiên, nhẹ nhàng, đàm thoại |
 | `thanhlong` | `hn_male_thanhlong_talk_48k-fhg` | Nam - Miền Bắc | Talkshow, đàm thoại, podcast năng động |
 | `anhkhoi` | `hn_male_phuthang_stor80dt_48k-fhg` | Nam - Miền Bắc | Trầm ấm, sâu lắng, tự sự / triết lý |
 | `minhquan` | `hn_male_minhquan_yt-stable` | Nam - Miền Bắc | Trẻ trung, phong cách review |

@@ -529,14 +529,15 @@ class TelegramInboundBot:
                 target_path = Path(job["target_path"])
 
             chosen_voice = job.get("voice")
-            from generate_podcast import create_podcast_for_book, resolve_voice_code, POPULAR_VOICES
+            from generate_podcast import create_podcast_for_book, resolve_voice_code, POPULAR_VOICES, get_reader_name
             target_voice = resolve_voice_code(chosen_voice)
             voice_desc = POPULAR_VOICES.get(target_voice, target_voice)
+            reader_name = get_reader_name(target_voice)
 
             self.send_message(
                 chat_id,
                 f"🎙️ <b>Bắt đầu tạo Podcast cho:</b> <code>{target_path.stem}</code>\n"
-                f"🧠 Gemini đang biên soạn kịch bản & Vbee TTS render giọng <b>{voice_desc}</b>...\n"
+                f"🧠 Gemini đang biên soạn kịch bản cho Host <b>{reader_name}</b> & Vbee TTS render giọng <b>{voice_desc}</b>...\n"
                 f"<i>(Thời gian xử lý khoảng 1 – 2 phút)</i>",
                 reply_to_message_id=msg_id,
                 thread_id=thread_id,
@@ -551,7 +552,7 @@ class TelegramInboundBot:
 
                     caption = (
                         f"🎙️ <b>Podcast Tóm Tắt Sách: {target_path.stem}</b>\n"
-                        f"✨ <i>Giọng đọc AI Vbee tự nhiên (128kbps)</i>\n\n"
+                        f"🗣️ <b>Người đọc:</b> {reader_name} (AI Vbee - 128kbps)\n\n"
                         f"👤 <b>Yêu cầu bởi:</b> {sender_name}\n"
                         f"🎧 <i>Bấm nghe trực tiếp trên Telegram!</i>"
                     )
@@ -645,13 +646,14 @@ class TelegramInboundBot:
 
             if with_podcast:
                 chosen_voice = job.get("voice")
-                from generate_podcast import create_podcast_for_book, resolve_voice_code, POPULAR_VOICES
+                from generate_podcast import create_podcast_for_book, resolve_voice_code, POPULAR_VOICES, get_reader_name
                 target_voice = resolve_voice_code(chosen_voice)
                 voice_desc = POPULAR_VOICES.get(target_voice, target_voice)
+                reader_name = get_reader_name(target_voice)
 
                 self.send_message(
                     chat_id,
-                    f"🎙️ <b>Đang tiếp tục tạo Audio Podcast cho:</b> <code>{stem}</code> qua Vbee TTS (giọng: <b>{voice_desc}</b>)...\n"
+                    f"🎙️ <b>Đang tiếp tục tạo Audio Podcast cho:</b> <code>{stem}</code> qua Vbee TTS (người đọc: <b>{reader_name}</b> - {voice_desc})...\n"
                     f"<i>(Khoảng 1 – 2 phút nữa sẽ có bản âm thanh gửi tới bạn)</i>",
                     reply_to_message_id=msg_id,
                     thread_id=thread_id,
@@ -665,7 +667,7 @@ class TelegramInboundBot:
 
                         podcast_caption = (
                             f"🎙️ <b>Podcast Tóm Tắt Sách: {stem}</b>\n"
-                            f"✨ <i>Giọng đọc AI Vbee tự nhiên (128kbps)</i>\n\n"
+                            f"🗣️ <b>Người đọc:</b> {reader_name} (AI Vbee - 128kbps)\n\n"
                             f"👤 <b>Yêu cầu bởi:</b> {sender_name}\n"
                             f"🎧 <i>Bấm nghe ngay trên Telegram!</i>"
                         )
