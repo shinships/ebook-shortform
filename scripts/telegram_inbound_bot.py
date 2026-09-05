@@ -236,22 +236,34 @@ class TelegramInboundBot:
             cmd = parts[0].split("@")[0].lower()
             arg = parts[1].strip() if len(parts) > 1 else ""
 
-            if cmd in ("/start", "/help"):
-                help_text = (
-                    "📚 <b>Chào mừng đến với Ebook Shortform Bot!</b>\n\n"
-                    "<b>Cách sử dụng:</b>\n"
-                    "1. 📥 <b>Tóm tắt sách:</b> Gửi file <code>.epub</code> hoặc <code>.pdf</code> vào đây.\n"
-                    "2. 🎙️ <b>Tạo Audio Podcast:</b>\n"
-                    "   • Gửi sách kèm ghi chú: <i>'tạo audio'</i> hoặc <i>'podcast'</i> (ví dụ: <i>'podcast giọng nam'</i>)\n"
-                    "   • Hoặc Reply vào file sách và gõ: <code>/podcast</code> hoặc <code>/podcast [giọng]</code>\n"
-                    "   • Hoặc gõ: <code>/podcast &lt;tên sách&gt; [giọng]</code>\n"
-                    "3. 📢 Mọi kết quả đều được đồng bộ tự động tới nhóm: https://t.me/c/3879100454/365\n\n"
-                    "<i>Lệnh hỗ trợ:</i>\n"
-                    "/voice — Xem danh sách giọng đọc Vbee và cách chọn giọng\n"
-                    "/podcast — Danh sách sách có thể tạo audio\n"
-                    "/status — Kiểm tra hàng đợi và trạng thái bot"
+            if cmd in ("/start", "/help", "/menu"):
+                from generate_podcast import resolve_voice_code, POPULAR_VOICES
+                curr_voice = resolve_voice_code()
+                curr_voice_name = POPULAR_VOICES.get(curr_voice, curr_voice)
+
+                menu_text = (
+                    "📖 <b>MENU HƯỚNG DẪN SỬ DỤNG BOT</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "1️⃣ <b>Tóm Tắt Sách Chuyên Sâu (Shortform):</b>\n"
+                    "• Gửi file <code>.epub</code> hoặc <code>.pdf</code> (dưới 20 MB) trực tiếp vào khung chat này.\n"
+                    "• Bot sẽ tự động phân tích cấu trúc, trích xuất bài học chuyên sâu kiểu Shortform và đóng gói thành file EPUB3 gửi lại cho bạn.\n\n"
+                    "2️⃣ <b>Tạo Audio Podcast Tóm Tắt Sách:</b>\n"
+                    "• <b>Tạo kèm khi gửi sách:</b> Nhắn kèm ghi chú khi gửi file (ví dụ: <i>'tạo audio'</i>, <i>'podcast'</i>, <i>'podcast lantrinh'</i>).\n"
+                    "• <b>Tạo từ sách trong thư viện:</b> Gõ <code>/podcast &lt;tên sách&gt;</code> (ví dụ: <code>/podcast remote</code>).\n"
+                    "• <b>Reply file sách:</b> Bấm Reply vào file sách bất kỳ trong chat và gõ <code>/podcast</code>.\n"
+                    "• Gõ <code>/podcast</code> để xem danh sách sách có sẵn có thể tạo audio.\n\n"
+                    "3️⃣ <b>Giọng Đọc Audio Podcast (Vbee TTS):</b>\n"
+                    f"• Giọng mặc định: <b>{curr_voice_name}</b>\n"
+                    "• Chọn giọng khác linh hoạt khi gõ lệnh: <code>/podcast &lt;tên sách&gt; [tên giọng]</code>\n"
+                    "  <i>(Ví dụ: <code>/podcast remote lantrinh</code> hoặc reply: <code>/podcast thanhlong</code>)</i>\n"
+                    "• Gõ <code>/voice</code> để xem danh sách đầy đủ các giọng đọc Bắc/Trung/Nam.\n\n"
+                    "4️⃣ <b>Kiểm Tra Hệ Thống:</b>\n"
+                    "• Gõ <code>/status</code> để kiểm tra hàng đợi xử lý và trạng thái hoạt động của bot.\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "📢 <b>Kênh nhận sách:</b> Kết quả được gửi về chat riêng và đồng bộ tới nhóm: https://t.me/c/3879100454/365\n"
+                    "💡 <i>Mẹo: Gõ <code>/</code> bất kỳ lúc nào để mở nhanh menu các lệnh!</i>"
                 )
-                self.send_message(chat_id, help_text, reply_to_message_id=msg_id, thread_id=thread_id)
+                self.send_message(chat_id, menu_text, reply_to_message_id=msg_id, thread_id=thread_id)
                 return
 
             elif cmd in ("/voice", "/voices"):
@@ -772,6 +784,24 @@ class TelegramInboundBot:
             except Exception as e:
                 print(f"[Watcher] Lỗi vòng lặp watcher: {e}", file=sys.stderr)
 
+    def register_bot_commands(self) -> None:
+        """Đăng ký danh sách lệnh với Telegram API để hiển thị menu gợi ý khi gõ '/'."""
+        commands = [
+            {"command": "menu", "description": "📖 Menu & Hướng dẫn sử dụng bot"},
+            {"command": "podcast", "description": "🎙️ Tạo Audio Podcast tóm tắt sách"},
+            {"command": "voice", "description": "🗣️ Xem & chọn giọng đọc AI Vbee"},
+            {"command": "status", "description": "🟢 Kiểm tra hàng đợi & hệ thống"},
+            {"command": "help", "description": "❓ Trợ giúp nhanh cách gửi sách"},
+        ]
+        try:
+            r = requests.post(f"{self.api_url}/setMyCommands", json={"commands": commands}, timeout=10)
+            if r.status_code == 200 and r.json().get("ok"):
+                print("📋 Đã đồng bộ menu lệnh với Telegram (gợi ý tự động khi gõ '/')")
+            else:
+                print(f"[Telegram] setMyCommands trả về lỗi: {r.text}", file=sys.stderr)
+        except Exception as e:
+            print(f"[Telegram] Lỗi khi gọi setMyCommands: {e}", file=sys.stderr)
+
     def run(self) -> None:
         """Vòng lặp chính lấy updates qua Long Polling."""
         print("🤖 Telegram Inbound Bot đang khởi động...")
@@ -784,6 +814,9 @@ class TelegramInboundBot:
             print(f"✅ Đã kết nối thành công tới Bot: @{bot_username}")
         except Exception as e:
             sys.exit(f"❌ Không thể kết nối tới Telegram API: {e}")
+
+        # Tự động đăng ký menu lệnh với Telegram để hiện gợi ý khi gõ '/'
+        self.register_bot_commands()
 
         worker = threading.Thread(target=self.worker_loop, daemon=True)
         worker.start()

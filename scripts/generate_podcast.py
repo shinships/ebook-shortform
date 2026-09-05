@@ -39,11 +39,11 @@ VBEE_TTS_URL = "https://vbee.vn/api/v1/tts"
 
 # Danh sách giọng đọc podcast tiêu biểu
 POPULAR_VOICES = {
+    "hn_male_manhdung_news_48k-fhg": "HN - Mạnh Dũng (Nam Bắc, trang trọng, thời sự)",
     "hn_female_ngochuyen_full_48k-fhg": "HN - Ngọc Huyền (Nữ Bắc, truyền cảm, podcast)",
     "hn_female_maiphuong_vdts_48k-fhg": "HN - Mai Phương (Nữ Bắc, tự nhiên, nhẹ nhàng)",
     "hn_male_thanhlong_talk_48k-fhg": "HN - Thanh Long (Nam Bắc, talkshow/đàm thoại)",
     "hn_male_phuthang_stor80dt_48k-fhg": "HN - Anh Khôi (Nam Bắc, trầm ấm, đọc truyện)",
-    "hn_male_manhdung_news_48k-fhg": "HN - Mạnh Dũng (Nam Bắc, trang trọng, thời sự)",
     "hn_male_minhquan_yt-stable": "HN - Minh Quân (Nam Bắc, trẻ trung, review)",
     "sg_female_lantrinh_vdts_48k-fhg": "SG - Lan Trinh (Nữ Nam, dịu dàng, tự nhiên)",
     "sg_female_thaotrinh_full_48k-fhg": "SG - Thảo Trinh (Nữ Nam, truyền cảm)",
@@ -54,6 +54,8 @@ POPULAR_VOICES = {
 }
 
 VOICE_ALIASES = {
+    "manhdung": "hn_male_manhdung_news_48k-fhg",
+    "mạnh dũng": "hn_male_manhdung_news_48k-fhg",
     "ngochuyen": "hn_female_ngochuyen_full_48k-fhg",
     "ngọc huyền": "hn_female_ngochuyen_full_48k-fhg",
     "maiphuong": "hn_female_maiphuong_vdts_48k-fhg",
@@ -62,8 +64,6 @@ VOICE_ALIASES = {
     "thanh long": "hn_male_thanhlong_talk_48k-fhg",
     "anhkhoi": "hn_male_phuthang_stor80dt_48k-fhg",
     "anh khôi": "hn_male_phuthang_stor80dt_48k-fhg",
-    "manhdung": "hn_male_manhdung_news_48k-fhg",
-    "mạnh dũng": "hn_male_manhdung_news_48k-fhg",
     "minhquan": "hn_male_minhquan_yt-stable",
     "minh quân": "hn_male_minhquan_yt-stable",
     "lantrinh": "sg_female_lantrinh_vdts_48k-fhg",
@@ -80,7 +80,7 @@ VOICE_ALIASES = {
     "duy phương": "hue_male_duyphuong_full_48k-fhg",
 }
 
-DEFAULT_FALLBACK_VOICE = "hn_female_ngochuyen_full_48k-fhg"
+DEFAULT_FALLBACK_VOICE = "hn_male_manhdung_news_48k-fhg"
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -305,7 +305,7 @@ def print_available_voices():
         print(f"• {code:35} -> {desc}{is_cur}")
     print("=" * 75)
     print(f"💡 Cấu hình giọng mặc định lâu dài: Thêm vào file .env:")
-    print(f"   VBEE_VOICE=\"hn_female_ngochuyen_full_48k-fhg\"\n")
+    print(f"   VBEE_VOICE=\"hn_male_manhdung_news_48k-fhg\"\n")
 
 
 def main():

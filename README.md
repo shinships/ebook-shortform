@@ -83,8 +83,8 @@ TELEGRAM_TOPIC_ID="365"   # ID của Topic trong Forum Group (nếu có)
 VBEE_APP_ID="your_vbee_app_id"
 VBEE_APP_NAME="ebook-short"
 VBEE_TOKEN="your_vbee_jwt_token"
-# Mã giọng đọc mặc định (ví dụ: Ngọc Huyền, Lan Trinh, Thanh Long...)
-VBEE_VOICE="hn_female_ngochuyen_full_48k-fhg"
+# Mã giọng đọc mặc định (Mặc định: hn_male_manhdung_news_48k-fhg - Mạnh Dũng)
+VBEE_VOICE="hn_male_manhdung_news_48k-fhg"
 ```
 
 ### 2. Các tùy chọn Backend LLM
@@ -198,12 +198,14 @@ Dịch vụ chạy ngầm 24/7 trên macOS cho phép bạn **gửi sách trực 
 
 - 📥 **Nhận sách tự động**: Gửi file `.epub` hoặc `.pdf` (dưới 20 MB) trực tiếp vào bot, bot tự tải về và xếp vào hàng đợi xử lý.
 - 🎙️ **Tạo Audio Podcast kèm theo**: Thêm từ khóa vào caption khi gửi sách (ví dụ: *"tạo audio"*, *"podcast"*, *"podcast giọng nam"*, *"audio lan trinh"*), bot sẽ tự động xuất cả EPUB lẫn Podcast MP3.
-- 💬 **Lệnh điều khiển tương tác**:
+- 💬 **Lệnh điều khiển tương tác (Gõ `/` để hiện menu gợi ý tự động)**:
+  - `/menu` — Hiển thị Menu & Hướng dẫn sử dụng bot đầy đủ, chi tiết.
   - `/podcast` — Xem danh sách các sách trong thư viện có thể tạo Podcast ngay.
   - `/podcast <tên sách> [giọng]` — Tìm sách và render podcast (ví dụ: `/podcast remote lantrinh`).
   - **Reply file sách + gõ `/podcast [giọng]`** — Render audio trực tiếp cho cuốn sách được reply.
   - `/voice` — Liệt kê danh sách các giọng đọc Vbee được hỗ trợ và hướng dẫn đổi giọng.
   - `/status` — Kiểm tra trạng thái hàng đợi, nhóm đồng bộ và giọng đọc đang kích hoạt.
+  - `/help` — Trợ giúp nhanh cách gửi file và tương tác với bot.
 - 📢 **Tự động đồng bộ**: Mọi kết quả (EPUB và MP3) đều được tự động gửi về khung chat riêng của người yêu cầu và gửi bản sao tới Topic nhóm thảo luận chung.
 
 ```bash
@@ -253,11 +255,11 @@ python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub 
 
 | Tên ngắn (Alias) | Mã giọng Vbee (`voice_code`) | Vùng miền / Giới tính | Phong cách phù hợp |
 |:---|:---|:---|:---|
-| `ngochuyen` | `hn_female_ngochuyen_full_48k-fhg` | Nữ - Miền Bắc *(Mặc định)* | Truyền cảm, chuẩn mực sách nói / podcast |
+| `manhdung` | `hn_male_manhdung_news_48k-fhg` | Nam - Miền Bắc *(Mặc định)* | Trang trọng, thời sự, sách kinh doanh |
+| `ngochuyen` | `hn_female_ngochuyen_full_48k-fhg` | Nữ - Miền Bắc | Truyền cảm, chuẩn mực sách nói / podcast |
 | `maiphuong` | `hn_female_maiphuong_vdts_48k-fhg` | Nữ - Miền Bắc | Tự nhiên, nhẹ nhàng, đàm thoại |
 | `thanhlong` | `hn_male_thanhlong_talk_48k-fhg` | Nam - Miền Bắc | Talkshow, đàm thoại, podcast năng động |
 | `anhkhoi` | `hn_male_phuthang_stor80dt_48k-fhg` | Nam - Miền Bắc | Trầm ấm, sâu lắng, tự sự / triết lý |
-| `manhdung` | `hn_male_manhdung_news_48k-fhg` | Nam - Miền Bắc | Trang trọng, thời sự, sách kinh doanh |
 | `minhquan` | `hn_male_minhquan_yt-stable` | Nam - Miền Bắc | Trẻ trung, phong cách review |
 | `lantrinh` | `sg_female_lantrinh_vdts_48k-fhg` | Nữ - Miền Nam | Dịu dàng, đàm thoại tự nhiên, dễ nghe |
 | `thaotrinh` | `sg_female_thaotrinh_full_48k-fhg` | Nữ - Miền Nam | Ấm áp, truyền cảm |
