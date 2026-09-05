@@ -11,11 +11,8 @@ from ebook_translator.core.cache import TranslationCache
 from ebook_translator.core.cover import resolve_cover
 from ebook_translator.core.glossary import Glossary, build_glossary
 from ebook_translator.core.llm import (
-    ANTHROPIC_DEFAULT_MODEL,
     DEFAULT_REGION,
     GOOGLE_AI_DEFAULT_MODEL,
-    PROXY_DEFAULT_BASE_URL,
-    PROXY_DEFAULT_MODEL,
     VERTEX_DEFAULT_MODEL,
     LLMClient,
 )
@@ -34,15 +31,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--model", help=(
         f"Model LLM (mặc định tự chọn theo backend: "
         f"Gemini AI Studio={GOOGLE_AI_DEFAULT_MODEL}, "
-        f"Anthropic={ANTHROPIC_DEFAULT_MODEL}, "
-        f"Vertex AI={VERTEX_DEFAULT_MODEL}, "
-        f"--proxy={PROXY_DEFAULT_MODEL})"
+        f"Vertex AI={VERTEX_DEFAULT_MODEL})"
     ))
-    parser.add_argument("--anthropic", action="store_true", help="Dùng Anthropic API trực tiếp (cần ANTHROPIC_API_KEY)")
     parser.add_argument("--project", help="GCP project ID cho Vertex AI (mặc định: env GOOGLE_CLOUD_PROJECT)")
     parser.add_argument("--region", help=f"Region Vertex AI (mặc định: {DEFAULT_REGION})")
-    parser.add_argument("--proxy", action="store_true", help="Dùng proxy vertex-key (legacy, cần VERTEX_KEY_API_KEY)")
-    parser.add_argument("--base-url", help=f"Base URL API proxy, chỉ dùng kèm --proxy (mặc định: {PROXY_DEFAULT_BASE_URL})")
     parser.add_argument("--cover", help=(
         "Ảnh bìa cho sách dịch (.jpg/.png/.gif/.webp). Mặc định dùng bìa của sách "
         "gốc; nếu bìa gốc không phải bìa thật (trang scan nội dung) thì bị bỏ."
@@ -70,9 +62,6 @@ def main(argv: list[str] | None = None) -> None:
             model=args.model,
             project_id=args.project,
             region=args.region,
-            proxy=args.proxy,
-            anthropic=args.anthropic,
-            base_url=args.base_url,
         )
 
     # ---- [1] Doc file goc ----

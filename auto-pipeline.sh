@@ -9,7 +9,6 @@
 # Cách dùng:
 #   ./auto-pipeline.sh                  # mặc định dùng gemini-2.5-flash
 #   ./auto-pipeline.sh --model gemini-2.5-pro
-#   ./auto-pipeline.sh --anthropic      # dùng Claude
 #   ./auto-pipeline.sh --dry-run        # chỉ liệt kê, không xử lý
 # =============================================================================
 set -euo pipefail
@@ -28,13 +27,24 @@ COVERS="$PROJECT_DIR/covers"
 
 LOG_FILE="$LOGS/$(date +%Y-%m-%d).md"
 
+# Nạp biến môi trường từ .env nếu có
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$PROJECT_DIR/.env"
+    set +a
+fi
+
 # ── Parse arguments ─────────────────────────────────────────────────────────
 DRY_RUN=false
 EXTRA_ARGS=()
+SPECIFIC_FILES=()
 
 for arg in "$@"; do
     if [[ "$arg" == "--dry-run" ]]; then
         DRY_RUN=true
+    elif [[ -f "$arg" ]]; then
+        SPECIFIC_FILES+=("$arg")
     else
         EXTRA_ARGS+=("$arg")
     fi
@@ -66,9 +76,13 @@ fi
 mkdir -p "$INBOX" "$OUTPUT" "$ORIGINALS" "$PROCESSING" "$LOGS"
 
 # ── Thu thập file đầu vào ───────────────────────────────────────────────────
-shopt -s nullglob
-FILES=("$INBOX"/*.epub "$INBOX"/*.pdf "$INBOX"/*.EPUB "$INBOX"/*.PDF)
-shopt -u nullglob
+if [[ ${#SPECIFIC_FILES[@]} -gt 0 ]]; then
+    FILES=("${SPECIFIC_FILES[@]}")
+else
+    shopt -s nullglob
+    FILES=("$INBOX"/*.epub "$INBOX"/*.pdf "$INBOX"/*.EPUB "$INBOX"/*.PDF)
+    shopt -u nullglob
+fi
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
     echo "📭 Không có file mới trong inbox/. Không làm gì."
@@ -127,8 +141,10 @@ for filepath in "${FILES[@]}"; do
         continue
     fi
 
-    # -- Di chuyển vào processing/ --
-    mv "$filepath" "$PROCESSING/$filename"
+    # -- Di chuyển vào processing/ (nếu chưa ở đó) --
+    if [[ "$filepath" != "$PROCESSING/$filename" ]]; then
+        mv "$filepath" "$PROCESSING/$filename"
+    fi
     processing_file="$PROCESSING/$filename"
 
     # -- Tìm ảnh bìa tùy chỉnh trong covers/ --
@@ -155,7 +171,7 @@ for filepath in "${FILES[@]}"; do
         -o "$output_epub" \
         --keep-workdir \
         $COVER_ARG \
-        "${EXTRA_ARGS[@]}" \
+        ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
         2>&1 | tee -a "$LOG_FILE"; then
 
         end_time=$(date +%s)
@@ -181,20 +197,20 @@ for filepath in "${FILES[@]}"; do
         [[ -d "$workdir" ]] && rm -rf "$workdir"
 
         echo ""
-        echo "   ✅ Thành công! (${duration_min}m${(( duration % 60 ))}s)"
+        echo "   ✅ Thành công! (${duration_min}m$(( duration % 60 ))s)"
         echo "   → $OUTPUT/${stem}_short.epub"
         echo ""
 
         # Gửi tới Telegram nếu có cấu hình trong .env hoặc env vars
         if [[ -f "$PROJECT_DIR/scripts/send_to_telegram.py" ]]; then
             echo "   📤 Đang gửi file tới Telegram..."
-            python3 "$PROJECT_DIR/scripts/send_to_telegram.py" "$OUTPUT/${stem}_short.epub" \
+            "$VENV_BIN/python" "$PROJECT_DIR/scripts/send_to_telegram.py" "$OUTPUT/${stem}_short.epub" \
                 --caption "📚 <b>${stem}</b> (Tóm tắt chuyên sâu kiểu Shortform)" || true
         fi
         echo ""
         {
             echo "- Trạng thái: ✅ thành công"
-            echo "- Thời gian: ${duration_min} phút ${(( duration % 60 ))} giây"
+            echo "- Thời gian: ${duration_min} phút $(( duration % 60 )) giây"
             echo "- Token: $token_line"
         } >> "$LOG_FILE"
 

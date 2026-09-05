@@ -66,9 +66,8 @@ Bạn có thể cấu hình các biến môi trường trực tiếp trong file 
 Mở file `.env` và điền các thông tin bạn có:
 
 ```bash
-# LLM Backend API Keys (chỉ cần ít nhất 1 backend)
+# LLM Backend API Keys (Gemini API key chính, Vertex AI backup)
 GEMINI_API_KEY="your_gemini_api_key"
-ANTHROPIC_API_KEY="your_claude_api_key"
 GOOGLE_CLOUD_PROJECT="your_gcp_project_id"
 
 # Telegram Bot (tùy chọn - để gửi file tự động sau khi tóm tắt)
@@ -81,10 +80,8 @@ TELEGRAM_TOPIC_ID="365"   # ID của Topic trong Forum Group (nếu có)
 
 | Backend | Biến môi trường / Cấu hình | Model mặc định | Ghi chú |
 |---|---|---|---|
-| **Google AI Studio** | `GEMINI_API_KEY` | `gemini-2.5-flash` | Đơn giản, miễn phí hạn mức cao tại [aistudio.google.com](https://aistudio.google.com/apikey). |
-| **Anthropic (Claude)** | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` | Chất lượng văn phong xuất sắc, lấy key tại [console.anthropic.com](https://console.anthropic.com). |
-| **Google Cloud Vertex AI** | `GOOGLE_CLOUD_PROJECT` | `gemini-3.6-flash` | Cho enterprise/GCP. Cần `gcloud auth application-default login`. Region mặc định `global`. |
-| **Proxy vertex-key** | `VERTEX_KEY_API_KEY` (dùng cờ `--proxy`) | `aws/claude-sonnet-5-medium` | Chế độ proxy nội bộ legacy. |
+| **Google AI Studio** *(chính)* | `GEMINI_API_KEY` | `gemini-3.7-flash` | Đơn giản, miễn phí hạn mức cao tại [aistudio.google.com](https://aistudio.google.com/apikey). |
+| **Google Cloud Vertex AI** *(backup)* | `GOOGLE_CLOUD_PROJECT` | `gemini-3.6-flash` | Cho enterprise/GCP. Cần `gcloud auth application-default login`. Region mặc định `global`. |
 
 ---
 
@@ -163,7 +160,6 @@ Script Bash tự động hóa hoàn toàn quy trình xử lý hàng loạt sách
 3. Các cờ bổ sung:
    ```bash
    ./auto-pipeline.sh --model gemini-2.5-pro    # Dùng Gemini Pro
-   ./auto-pipeline.sh --anthropic              # Dùng Claude
    ./auto-pipeline.sh --dry-run                # Chỉ xem danh sách file cần xử lý
    ```
 4. Sau khi hoàn thành, file `.epub` tóm tắt sẽ nằm tại `output/`, bản gốc được chuyển sang `output/originals/`, nhật ký ghi lại ở `logs/YYYY-MM-DD.md`, và file tự động được gửi tới Telegram Topic nếu cấu hình `.env`.
@@ -247,7 +243,7 @@ ebook-shortform/
         │   ├── translator.py       # Dịch nội dung và tiêu đề mục lục
         │   ├── summarizer.py       # Phân tích, chia bài và biên soạn Shortform
         │   ├── cache.py            # Quản lý bộ nhớ đệm tiếp tục công việc
-        │   └── llm.py              # Client tích hợp Gemini, Anthropic, Vertex AI
+        │   └── llm.py              # Client tích hợp Gemini AI Studio & Vertex AI
         └── writers/
             └── epub_writer.py      # Đóng gói và xuất file chuẩn EPUB3
 ```

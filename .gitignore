@@ -23,6 +23,8 @@ lessons_output/
 *.analysis.json
 *.zip
 /Tom-tat_*.md
+/Jason*.md
+/Jason*.epub
 /input.*
 
 # Pipeline runtime contents (folders tracked via .gitkeep)
@@ -41,3 +43,6 @@ lessons_output/
 !/marketing/.gitkeep
 .venv-mac/
 .venv-windows-old/
+
+# Covers are project assets to commit; ignore generated ones if needed
+# /covers/*  <- uncomment to ignore covers
