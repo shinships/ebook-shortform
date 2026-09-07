@@ -1,14 +1,14 @@
 # ebook-shortform
 
-Bộ công cụ CLI và pipeline tự động hóa xử lý ebook toàn diện bằng LLM: hỗ trợ dịch thuật chuẩn xác, biên soạn **tóm tắt chuyên sâu kiểu Shortform** (microlearning), đóng gói chuẩn EPUB3, tự động sản xuất **Audio Podcast MP3** bằng Vbee AIVoice TTS, và tích hợp **Telegram Inbound Bot 2 chiều chạy ngầm 24/7**.
+Bộ công cụ CLI và pipeline tự động hóa xử lý ebook toàn diện bằng LLM: hỗ trợ dịch thuật toàn văn chuẩn xác, biên soạn **tóm tắt chuyên sâu kiểu Shortform** (microlearning), đóng gói chuẩn EPUB3, và tích hợp **Telegram Book Bot 2 chiều chạy ngầm 24/7** với menu tương tác 1-chạm.
 
 Dự án gồm các thành phần cốt lõi:
 
 - **`ebook-translate`** — Dịch toàn bộ ebook tiếng Anh sang tiếng Việt, bảo toàn định dạng HTML/CSS, cấu trúc chương mục và hệ thống thuật ngữ nhất quán.
 - **`ebook-summarize`** — Biên soạn tóm tắt ebook thành "sách hướng dẫn chuyên sâu" kiểu Shortform: mỗi bài 15–25 phút trả lời *vì sao ý tưởng quan trọng → cơ chế hoạt động & case study → góc nhìn mở rộng/đối chiếu → tóm lược điểm cốt lõi → bài tập tự vấn & hành động thực tiễn*.
 - **`auto-pipeline.sh`** — Dây chuyền tự động hóa: theo dõi thư mục `inbox/`, tự động tóm tắt sách, ghi log chi tiết và đẩy thẳng file `.epub` vào Topic Telegram.
-- **`scripts/generate_podcast.py`** — Tự động chuyển đổi tài liệu tóm tắt thành kịch bản solo Podcast đàm thoại hấp dẫn và gọi Vbee TTS API render thành file MP3 chất lượng cao.
-- **`scripts/telegram_inbound_bot.py`** — Dịch vụ Telegram Bot 2 chiều chạy ngầm 24/7 trên macOS (`@ebookshort_bot`), cho phép người dùng gửi sách từ điện thoại, nhận lại bản EPUB và Podcast MP3 ngay tại khung chat.
+- **`scripts/generate_podcast.py`** — Công cụ CLI tùy chọn: chuyển đổi tài liệu tóm tắt thành kịch bản podcast và render MP3 bằng Vbee TTS API.
+- **`scripts/telegram_inbound_bot.py`** — Dịch vụ Telegram Bot chuyên biệt 24/7 trên macOS (`@ebookshort_bot`), hỗ trợ gửi sách từ điện thoại, tương tác bằng nút bấm 1-chạm (Dịch toàn bộ, Tóm tắt Shortform, Đọc thử chương đầu), Instant 1-Page Brief và quản lý thư viện sách.
 - **`scripts/setup_schedule.sh`** — Bộ công cụ quản trị daemon launchd cho hệ thống bot và lịch xử lý tự động hàng ngày.
 
 ---
@@ -18,8 +18,7 @@ Dự án gồm các thành phần cốt lõi:
 - **Đa định dạng đầu vào**: Hỗ trợ `.epub`, `.pdf` (bao gồm cả PDF văn bản và PDF trang scan — tự động OCR bằng LLM Vision không cần cài Tesseract).
 - **Đầu ra chuẩn EPUB3**: Giữ nguyên hình ảnh, trang bìa tiêu chuẩn (EPUB2 + EPUB3), mục lục điều hướng phân cấp (nav + ncx) và font chữ tiếng Việt hiển thị đẹp mắt trên Apple Books, Kindle, Kobo.
 - **Cấu trúc tóm tắt đa chiều**: Mỗi bài học đi qua chuỗi phân tích nhân quả (*reasoning*), bóc tách bối cảnh, giới hạn áp dụng & giả định ngầm (*assumptions & limits*), kèm box *Góc nhìn thêm* đối chiếu triết lý tác giả với các học giả/chuyên gia khác.
-- **Audio Podcast AI tiếng Việt chân thực**: Biên soạn kịch bản đàm thoại tự nhiên với Gemini, tích hợp hơn 30+ giọng đọc AI Vbee chất lượng cao đa vùng miền (Bắc/Trung/Nam), hỗ trợ đặt giọng qua lệnh hoặc cấu hình.
-- **Tương tác 2 chiều qua Telegram 24/7**: Gửi sách trực tiếp qua Telegram trên điện thoại, bot tự động đưa vào queue xử lý, tạo EPUB và Podcast, đồng bộ thẳng về nhóm và topic thảo luận.
+- **Tương tác 2 chiều qua Telegram 24/7**: Gửi sách trực tiếp qua Telegram trên điện thoại, tương tác menu nút bấm chọn Dịch hoặc Tóm tắt, nhận ngay bản tóm tắt 1 trang và file EPUB hoàn thiện, đồng bộ thẳng về nhóm và topic thảo luận.
 - **Ảnh bìa thông minh**: Kiểm duyệt ảnh bìa bằng LLM Vision để tránh tình trạng lấy nhầm trang scan mục lục/chữ li ti làm bìa sách (lỗi phổ biến khi convert qua Calibre).
 - **Cơ chế Cache thông minh**: Khi bị ngắt giữa chừng (Ctrl+C, mạng chập chờn), chỉ cần chạy lại là hệ thống tiếp tục từ điểm dừng, không tốn thêm chi phí LLM.
 
@@ -192,21 +191,29 @@ python scripts/send_to_telegram.py output/sach_short.epub \
 
 ---
 
-### 3. Telegram Inbound Bot 2 chiều (`scripts/telegram_inbound_bot.py`)
+### 3. Telegram Book Bot Chuyên Biệt (`scripts/telegram_inbound_bot.py`)
 
-Dịch vụ chạy ngầm 24/7 trên macOS cho phép bạn **gửi sách trực tiếp từ điện thoại/iPad** qua Telegram (`@ebookshort_bot`) và nhận lại bản tóm tắt EPUB cùng Audio Podcast MP3 ngay tại khung chat:
+Dịch vụ chạy ngầm 24/7 trên macOS biến Telegram (`@ebookshort_bot`) thành **Trung tâm Tiếp nhận, Dịch thuật Toàn văn & Tóm tắt Sách Chuyên sâu kiểu Shortform**:
 
-- 📥 **Nhận sách tự động**: Gửi file `.epub` hoặc `.pdf` (dưới 20 MB) trực tiếp vào bot, bot tự tải về và xếp vào hàng đợi xử lý.
-- 🎙️ **Tạo Audio Podcast kèm theo**: Thêm từ khóa vào caption khi gửi sách (ví dụ: *"tạo audio"*, *"podcast"*, *"podcast giọng nam"*, *"audio lan trinh"*), bot sẽ tự động xuất cả EPUB lẫn Podcast MP3.
-- 💬 **Lệnh điều khiển tương tác (Gõ `/` để hiện menu gợi ý tự động)**:
-  - `/menu` — Hiển thị Menu & Hướng dẫn sử dụng bot đầy đủ, chi tiết.
-  - `/podcast` — Xem danh sách các sách trong thư viện có thể tạo Podcast ngay.
-  - `/podcast <tên sách> [giọng]` — Tìm sách và render podcast (ví dụ: `/podcast remote lantrinh`).
-  - **Reply file sách + gõ `/podcast [giọng]`** — Render audio trực tiếp cho cuốn sách được reply.
-  - `/voice` — Liệt kê danh sách các giọng đọc Vbee được hỗ trợ và hướng dẫn đổi giọng.
-  - `/status` — Kiểm tra trạng thái hàng đợi, nhóm đồng bộ và giọng đọc đang kích hoạt.
-  - `/help` — Trợ giúp nhanh cách gửi file và tương tác với bot.
-- 📢 **Tự động đồng bộ**: Mọi kết quả (EPUB và MP3) đều được tự động gửi về khung chat riêng của người yêu cầu và gửi bản sao tới Topic nhóm thảo luận chung.
+- 📥 **Menu Tương Tác 1-Chạm (Inline Keyboard)**: Khi gửi file `.epub` hoặc `.pdf` (dưới 20 MB) từ điện thoại/iPad, bot tự động phản hồi menu nút bấm trực quan để bạn chạm chọn ngay:
+  - `⚡ Tóm tắt Shortform (3–5p)`: Luận đề cốt lõi, 3 trụ cột tư duy, Shortform Notes & Bảng Heuristics.
+  - `📖 Dịch toàn bộ sách (~20p)`: Dịch toàn văn sang tiếng Việt chuẩn xác, bảo toàn layout, ảnh bìa & hệ thống glossary.
+  - `🚀 Cả Dịch & Tóm tắt`: Xuất bản cả 2 ấn phẩm EPUB hoàn chỉnh.
+  - `👁️ Đọc thử 1 chương`: Dịch mẫu chương đầu để kiểm tra chất lượng văn phong trước khi dịch cả cuốn.
+- ⚡ **Instant 1-Page Brief**: Đọc ngay bản tóm tắt điều hành (Executive Brief) trực tiếp trong tin nhắn chat mà không cần mở ứng dụng đọc sách.
+- 💬 **Hệ Thống Lệnh Điều Khiển Toàn Diện (Gõ `/` để hiện menu gợi ý)**:
+  - `/menu` — Hiển thị Menu & Hướng dẫn sử dụng chi tiết.
+  - `/library` hoặc `/books` — Thư viện sách cá nhân đã xử lý (xem danh mục & tải lại file ngay).
+  - `/translate` hoặc `/dich` — Dịch toàn văn (hỗ trợ Reply tin nhắn file sách).
+  - `/summarize` hoặc `/tomtat` — Tóm tắt chuyên sâu (hỗ trợ Reply tin nhắn file sách).
+  - `/quick <tên sách>` — Đọc ngay bản tóm tắt 1 trang trong tin nhắn.
+  - `/glossary <tên sách>` — Tra cứu bảng thuật ngữ song ngữ Anh - Việt được chuẩn hóa.
+  - `/ask <câu hỏi>` — Reply file sách và hỏi đáp phản biện với nội dung cuốn sách.
+  - `/mode` — Cài đặt chế độ xử lý mặc định (`ask`, `summarize`, `translate`, `both`).
+  - `/model` — Chuyển đổi mô hình AI (`gemini-3.7-flash` hoặc `gemini-2.5-pro`).
+  - `/status` — Kiểm tra hàng đợi, model đang dùng và thống kê thư viện.
+  - `/help` — Trợ giúp nhanh cách gửi sách và các mẹo sử dụng.
+- 📢 **Tự động đồng bộ 2 chiều**: Xuất bản phẩm hoàn tất đều được gửi về chat riêng của người gửi và gửi bản sao tới nhóm thảo luận. Đồng thời, bot tự động theo dõi thư mục `output/` để thông báo khi có file mới được biên soạn từ máy Mac.
 
 ```bash
 # Quản lý dịch vụ bot ngầm bằng launchd (không cần mở Terminal hay IDE):

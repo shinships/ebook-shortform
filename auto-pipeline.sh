@@ -120,6 +120,29 @@ for filepath in "${FILES[@]}"; do
     filename="$(basename "$filepath")"
     stem="${filename%.*}"
 
+    # -- Chuẩn hóa tên file: loại bỏ noise tag thư viện sách (z_library, 1lib, libgen, v.v.) --
+    clean_stem=$(python3 -c "
+import sys, re
+stem = sys.argv[1]
+pattern = r'([_,\s\.\-]+|\b)[\(\[]?(?:z[-_]?library|1lib|z-lib|zlib|libgen)[\s\S]*$'
+cleaned = re.sub(pattern, '', stem, flags=re.IGNORECASE)
+cleaned = re.sub(r'[\s_,\.\-\(\)\[\]]+$', '', cleaned).strip()
+print(cleaned if cleaned else stem)
+" "$stem" 2>/dev/null || echo "$stem")
+
+    if [[ "$clean_stem" != "$stem" ]]; then
+        ext="${filename##*.}"
+        clean_filename="${clean_stem}.${ext}"
+        clean_path="$(dirname "$filepath")/$clean_filename"
+        if [[ "$filepath" != "$clean_path" && ! -f "$clean_path" ]]; then
+            mv "$filepath" "$clean_path"
+            filepath="$clean_path"
+            filename="$clean_filename"
+            stem="$clean_stem"
+            echo "   🏷️  Đã chuẩn hóa tên file: $filename"
+        fi
+    fi
+
     echo "────────────────────────────────────────────────────────"
     echo "📖 [$TOTAL/${#FILES[@]}] $filename"
     echo "────────────────────────────────────────────────────────"
