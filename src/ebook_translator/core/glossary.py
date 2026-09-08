@@ -120,16 +120,41 @@ def _sample_text(book: Book) -> str:
 
 
 def _parse_json(raw: str) -> dict | None:
-    raw = raw.strip()
-    # bo markdown fence neu model lo them vao
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                return None
+    if not raw or not raw.strip():
         return None
+    raw_clean = raw.strip()
+
+    # 1. Thu json.loads truc tiep (strict=False de chap nhan ky tu xuong dong tho trong chuoi)
+    try:
+        return json.loads(raw_clean, strict=False)
+    except Exception:
+        pass
+
+    # 2. Loai bo markdown code fence
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw_clean)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    try:
+        return json.loads(cleaned, strict=False)
+    except Exception:
+        pass
+
+    # 3. Tim khoi JSON { ... } lon nhat
+    m = re.search(r"\{.*\}", raw_clean, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0), strict=False)
+        except Exception:
+            pass
+
+    # 4. Dung json_repair tu dong sua loi cu phap (trailing comma, unescaped quote, unclosed brackets)
+    try:
+        import json_repair
+
+        parsed = json_repair.repair_json(raw_clean, return_objects=True)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    return None
+

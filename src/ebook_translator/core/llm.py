@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 import time
 
-def _load_env_file() -> None:
+def _load_env_file(override: bool = True) -> None:
     for candidate in (Path.cwd() / ".env", Path(__file__).resolve().parents[3] / ".env"):
         if candidate.is_file():
             try:
@@ -28,8 +28,9 @@ def _load_env_file() -> None:
                     k, v = line.split("=", 1)
                     k = k.strip()
                     v = v.strip().strip("'\"")
-                    if k and k not in os.environ:
-                        os.environ[k] = v
+                    if k:
+                        if override or k not in os.environ:
+                            os.environ[k] = v
             except Exception:
                 pass
             break
@@ -40,16 +41,17 @@ _load_env_file()
 VERTEX_DEFAULT_MODEL = "gemini-3.6-flash"
 GOOGLE_AI_DEFAULT_MODEL = "gemini-3.7-flash"
 GOOGLE_AI_FALLBACK_MODELS = [
-    "gemini-flash-latest",
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-flash-latest",
 ]
 
 # Aliases giu tuong thich nguoc (import tu ngoai)
 DEFAULT_MODEL = VERTEX_DEFAULT_MODEL
 DEFAULT_REGION = "global"  # gemini-3.x-flash chi co o region "global"
-MAX_RETRIES = 5
+MAX_RETRIES = 10
 
 SETUP_HINT = (
     "Không tìm thấy API key hoặc GCP project. Chọn một trong các cách:\n"
@@ -90,9 +92,16 @@ class LLMClient:
     def _init_google_ai(self, model: str | None) -> None:
         from google import genai
 
-        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        _load_env_file(override=True)
+        keys_str = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not keys_str:
+            raise SystemExit("Không tìm thấy GEMINI_API_KEY")
+            
+        self._api_keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+        self._current_key_idx = 0
+        
         try:
-            self.client = genai.Client(api_key=key)
+            self.client = genai.Client(api_key=self._api_keys[self._current_key_idx])
         except Exception as exc:
             raise SystemExit(
                 f"Không khởi tạo được Google AI client: {exc}\n"
@@ -100,7 +109,7 @@ class LLMClient:
             )
         self.model = model or GOOGLE_AI_DEFAULT_MODEL
         self._fallback_models = [m for m in GOOGLE_AI_FALLBACK_MODELS if m != self.model]
-        print(f"  Backend: Google AI Studio — model {self.model}", file=sys.stderr)
+        print(f"  Backend: Google AI Studio — model {self.model} (sẵn sàng {len(self._api_keys)} API keys)", file=sys.stderr)
 
     def _init_vertex(self, model: str | None, project_id: str | None, region: str | None) -> None:
         self.client = _make_vertex_client(project_id, region)
@@ -130,6 +139,7 @@ class LLMClient:
         self, system: str, messages: list[dict], max_tokens: int, json_mode: bool = False
     ) -> str:
         from google.genai import errors, types
+        import google.genai as genai
 
         contents = _to_gemini_contents(messages)
         config = types.GenerateContentConfig(
@@ -138,6 +148,7 @@ class LLMClient:
             response_mime_type="application/json" if json_mode else None,
         )
         delay = 5.0
+        keys_tried = 0
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 resp = self.client.models.generate_content(
@@ -153,17 +164,37 @@ class LLMClient:
             except errors.APIError as exc:
                 code = getattr(exc, "code", None) or 0
                 msg = str(exc)
-                is_quota = code == 429 and ("PerDay" in msg or "quota" in msg.lower() or "RESOURCE_EXHAUSTED" in msg)
+                is_daily_quota = code == 429 and any(x in msg.lower() for x in ("perday", "freetierperday", "daily"))
+                is_rate_limit = code == 429 and not is_daily_quota
                 is_unavailable = code in (500, 502, 503, 504) or "UNAVAILABLE" in msg or "high demand" in msg.lower()
-                if (is_quota or is_unavailable) and hasattr(self, "_fallback_models") and self._fallback_models:
-                    old_model = self.model
-                    self.model = self._fallback_models.pop(0)
-                    reason = "chạm hạn mức" if is_quota else "quá tải/tạm thời không khả dụng"
-                    print(
-                        f"  [fallback] Model {old_model} {reason} ({code}), chuyển sang {self.model}...",
-                        file=sys.stderr,
-                    )
+
+                # 1. Neu la 429 va con API key chua thu: xoay sang key tiep theo
+                if (is_daily_quota or is_rate_limit) and hasattr(self, "_api_keys") and len(self._api_keys) > 1 and keys_tried < len(self._api_keys) - 1:
+                    keys_tried += 1
+                    self._current_key_idx = (self._current_key_idx + 1) % len(self._api_keys)
+                    print(f"  [fallback] API key chạm giới hạn, chuyển sang key dự phòng (index: {self._current_key_idx})...", file=sys.stderr)
+                    self.client = genai.Client(api_key=self._api_keys[self._current_key_idx])
                     continue
+
+                # 2. Chi fallback model khi het quota ngay tren tat ca key hoac server 5xx unavailable keo dai (attempt >= 2)
+                if (is_daily_quota or (is_unavailable and attempt >= 2)) and hasattr(self, "_fallback_models"):
+                    if not self._fallback_models:
+                        self._fallback_models = [m for m in GOOGLE_AI_FALLBACK_MODELS if m != self.model]
+                    if self._fallback_models:
+                        old_model = self.model
+                        self.model = self._fallback_models.pop(0)
+                        reason = "hết quota ngày" if is_daily_quota else "quá tải/tạm thời không khả dụng"
+                        print(
+                            f"  [fallback] Model {old_model} {reason} ({code}), chuyển sang {self.model}...",
+                            file=sys.stderr,
+                        )
+                        keys_tried = 0
+                        continue
+
+                # 3. Neu la rate limit phut (RPM/TPM): khong ha cap model, reset keys_tried va backoff
+                if is_rate_limit:
+                    keys_tried = 0
+
                 if code not in (429,) and code < 500:
                     raise  # 4xx khac (sai project, bad request) thi khong retry
                 if attempt == MAX_RETRIES:

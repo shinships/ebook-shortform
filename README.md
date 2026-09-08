@@ -7,7 +7,7 @@ Dự án gồm các thành phần cốt lõi:
 - **`ebook-translate`** — Dịch toàn bộ ebook tiếng Anh sang tiếng Việt, bảo toàn định dạng HTML/CSS, cấu trúc chương mục và hệ thống thuật ngữ nhất quán.
 - **`ebook-summarize`** — Biên soạn tóm tắt ebook thành "sách hướng dẫn chuyên sâu" kiểu Shortform: mỗi bài 15–25 phút trả lời *vì sao ý tưởng quan trọng → cơ chế hoạt động & case study → góc nhìn mở rộng/đối chiếu → tóm lược điểm cốt lõi → bài tập tự vấn & hành động thực tiễn*.
 - **`auto-pipeline.sh`** — Dây chuyền tự động hóa: theo dõi thư mục `inbox/`, tự động tóm tắt sách, ghi log chi tiết và đẩy thẳng file `.epub` vào Topic Telegram.
-- **`scripts/generate_podcast.py`** — Công cụ CLI tùy chọn: chuyển đổi tài liệu tóm tắt thành kịch bản podcast và render MP3 bằng Vbee TTS API.
+- **`scripts/generate_podcast.py`** — Công cụ CLI sản xuất Audio Podcast/Audiobook: kịch bản đàm thoại solo lôi cuốn biên soạn bởi Gemini và render âm thanh độ phân giải cao 48kHz bằng **VieNeu-TTS v3 Turbo** (mặc định on-device) hoặc Vbee Cloud API.
 - **`scripts/telegram_inbound_bot.py`** — Dịch vụ Telegram Bot chuyên biệt 24/7 trên macOS (`@ebookshort_bot`), hỗ trợ gửi sách từ điện thoại, tương tác bằng nút bấm 1-chạm (Dịch toàn bộ, Tóm tắt Shortform, Đọc thử chương đầu), Instant 1-Page Brief và quản lý thư viện sách.
 - **`scripts/setup_schedule.sh`** — Bộ công cụ quản trị daemon launchd cho hệ thống bot và lịch xử lý tự động hàng ngày.
 
@@ -60,7 +60,7 @@ Copy-Item .env.example .env
 
 ---
 
-## Cấu hình Backend LLM, Telegram & Vbee TTS
+## Cấu hình Backend LLM, Telegram & TTS Audio
 
 Bạn có thể cấu hình các biến môi trường trực tiếp trong file `.env` hoặc export ra terminal. Tool tự động nhận diện theo thứ tự ưu tiên:
 
@@ -78,11 +78,15 @@ TELEGRAM_BOT_TOKEN="your_bot_token_here"
 TELEGRAM_CHAT_ID="-100xxxxxxxxxx"
 TELEGRAM_TOPIC_ID="365"   # ID của Topic trong Forum Group (nếu có)
 
-# Vbee AIVoice TTS API (để tạo Audio Podcast tóm tắt sách tiếng Việt)
+# Text-to-Speech (TTS) cho Audio Podcast & Sách nói
+TTS_ENGINE="vieneu"       # "vieneu" (mặc định on-device 48kHz) hoặc "vbee" (Cloud API)
+VIENEU_VOICE="Minh Quân"  # Giọng Host mặc định (Thái Sơn, Anh Khôi, Quỳnh Anh, Ngọc Huyền...)
+# VIENEU_REF_AUDIO="covers/host_sample.wav"  # Tùy chọn: File âm thanh mẫu 3-8s để clone giọng
+
+# Vbee AIVoice TTS API (dự phòng khi cần dùng Cloud API của Vbee)
 VBEE_APP_ID="your_vbee_app_id"
 VBEE_APP_NAME="ebook-short"
 VBEE_TOKEN="your_vbee_jwt_token"
-# Mã giọng đọc mặc định (Mặc định: hn_female_maiphuong_vdts_48k-fhg - Mai Phương)
 VBEE_VOICE="hn_female_maiphuong_vdts_48k-fhg"
 ```
 
@@ -231,49 +235,49 @@ Dịch vụ chạy ngầm 24/7 trên macOS biến Telegram (`@ebookshort_bot`) t
 
 ### 4. Tạo Audio Podcast Tóm Tắt Sách (`scripts/generate_podcast.py`)
 
-Quy trình tự động hóa sản xuất nội dung âm thanh từ sách tóm tắt bằng sự kết hợp giữa **Gemini AI** và **Vbee AIVoice TTS**:
+Quy trình tự động hóa sản xuất nội dung âm thanh từ sách tóm tắt bằng sự kết hợp giữa **Gemini AI** và **VieNeu-TTS v3 Turbo** (mặc định) / **Vbee AIVoice**:
 
 1. **Biên kịch Podcast thông minh**: Gemini đóng vai trò Host/Producer chuyên nghiệp, phân tích tài liệu tóm tắt và chuyển thể thành **kịch bản nói đơn thoại (Solo Podcast Script)** kéo dài 8–12 phút. Văn phong đàm thoại gần gũi, mở đầu cuốn hút, xâu chuỗi bài học thành câu chuyện liền mạch và đúc kết hành động thực tiễn.
-2. **Chuyển đổi âm thanh tự nhiên**: Gọi API Vbee AIVoice để render kịch bản thành file MP3 chuẩn 128kbps với ngữ điệu ngắt nghỉ chân thực.
-3. **Phân phối tức thì**: Tự động lưu trữ vào `output/podcasts/` và tùy chọn đẩy thẳng lên kênh/topic Telegram.
+2. **Chuyển đổi âm thanh chất lượng cao 48kHz (VieNeu v3 Turbo)**: Chạy hoàn toàn on-device (CPU/Apple Silicon hoặc GPU), phát âm tiếng Anh - Việt song ngữ liền mạch (code-switching), không lo giới hạn ký tự và hỗ trợ **Instant Voice Cloning**. (Vẫn hỗ trợ fallback sang Vbee Cloud API nếu muốn).
+3. **Phân phối tức thì**: Tự động xuất file MP3 chuẩn 192kbps (kèm tùy biến tốc độ `atempo`), lưu trữ vào `output/podcasts/` và tùy chọn đẩy thẳng lên kênh/topic Telegram.
 
 #### Cách sử dụng từ dòng lệnh:
 
 ```bash
-# Xem danh sách giọng đọc Vbee có sẵn
+# Xem danh sách giọng đọc hỗ trợ (VieNeu & Vbee)
 python scripts/generate_podcast.py --list-voices
 
-# Tạo Podcast MP3 từ file tóm tắt và tự động gửi tới Telegram
+# Tạo Podcast MP3 bằng VieNeu mặc định và tự động gửi tới Telegram
 python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --telegram
 
-# Chọn giọng đọc bằng tên gợi nhớ (alias) hoặc mã Vbee:
-python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice lantrinh
-python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice thanhlong
-python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice hn_male_phuthang_stor80dt_48k-fhg
+# Chọn giọng Host bằng tên hoặc alias:
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice "Thái Sơn"
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice "Anh Khôi"
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice "Quỳnh Anh"
 
-# Tùy chỉnh tốc độ đọc (0.8 - 1.5, mặc định 1.0):
-python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --speed 1.05
+# Nhân bản giọng nói tức thì (Instant Voice Cloning) từ 1 file mẫu (3-8 giây):
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --ref-audio "covers/my_voice.wav"
 
-# Chỉ tạo kịch bản kịch bản văn bản (không gọi TTS API):
-python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --script-only
+# Tùy chỉnh tốc độ đọc (1.1x, 1.2x, mặc định 1.1):
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --speed 1.15
+
+# Tùy chọn sử dụng Vbee Cloud API thay vì VieNeu:
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --engine vbee --voice maiphuong
 ```
 
-#### Bảng tra cứu các giọng đọc tiêu biểu:
+#### Bảng tra cứu giọng đọc VieNeu tiêu biểu:
 
-| Tên ngắn (Alias) | Mã giọng Vbee (`voice_code`) | Vùng miền / Giới tính | Phong cách phù hợp |
-|:---|:---|:---|:---|
-| `maiphuong` | `hn_female_maiphuong_vdts_48k-fhg` | Nữ - Miền Bắc *(Mặc định)* | Tự nhiên, nhẹ nhàng, đàm thoại, podcast |
-| `manhdung` | `hn_male_manhdung_news_48k-fhg` | Nam - Miền Bắc | Trang trọng, thời sự, sách kinh doanh |
-| `ngochuyen` | `hn_female_ngochuyen_full_48k-fhg` | Nữ - Miền Bắc | Truyền cảm, chuẩn mực sách nói / podcast |
-| `thanhlong` | `hn_male_thanhlong_talk_48k-fhg` | Nam - Miền Bắc | Talkshow, đàm thoại, podcast năng động |
-| `anhkhoi` | `hn_male_phuthang_stor80dt_48k-fhg` | Nam - Miền Bắc | Trầm ấm, sâu lắng, tự sự / triết lý |
-| `minhquan` | `hn_male_minhquan_yt-stable` | Nam - Miền Bắc | Trẻ trung, phong cách review |
-| `lantrinh` | `sg_female_lantrinh_vdts_48k-fhg` | Nữ - Miền Nam | Dịu dàng, đàm thoại tự nhiên, dễ nghe |
-| `thaotrinh` | `sg_female_thaotrinh_full_48k-fhg` | Nữ - Miền Nam | Ấm áp, truyền cảm |
-| `trungkien` | `sg_male_trungkien_vdts_48k-fhg` | Nam - Miền Nam | Nam tính, ấm áp, truyền cảm |
-| `minhhoang` | `sg_male_minhhoang_full_48k-fhg` | Nam - Miền Nam | Hiện đại, năng động |
-| `huonggiang` | `hue_female_huonggiang_full_48k-fhg` | Nữ - Miền Trung (Huế) | Ngọt ngào, nhẹ nhàng |
-| `duyphuong` | `hue_male_duyphuong_full_48k-fhg` | Nam - Miền Trung (Huế) | Trầm ấm, sâu lắng |
+| Tên Host / Mã | Vùng miền / Phong cách | Điểm mạnh nổi bật |
+|:---|:---|:---|
+| **Minh Quân** | Nam - Miền Bắc *(Mặc định)* | Tự nhiên, đàm thoại sinh động, phong cách podcast hiện đại |
+| **Thái Sơn** | Nam - Miền Nam | Trầm ấm, truyền cảm, cực kỳ thích hợp cho Audiobook |
+| **Anh Khôi** | Nam - Miền Bắc | Sâu lắng, đĩnh đạc, đọc sách kỹ năng & triết lý sống |
+| **Quỳnh Anh** | Nữ - Miền Bắc | Diễn cảm, rõ ràng, giàu cảm xúc |
+| **Ngọc Huyền** | Nữ - Miền Bắc | Tự nhiên, phong cách talkshow/podcast thanh lịch |
+| **Thanh Bình** | Nam - Miền Bắc | Kể chuyện mạch lạc, cuốn hút |
+| **Thục Đoan** | Nữ - Miền Nam | Kể chuyện dịu dàng, êm ái miền Nam |
+| **Quang Sơn** | Nam - Miền Trung (Huế) | Tự nhiên, truyền cảm âm sắc miền Trung |
+| **Trúc Ly** | Nữ - Miền Bắc | Trẻ trung, tươi sáng, nhẹ nhàng |
 
 ---
 

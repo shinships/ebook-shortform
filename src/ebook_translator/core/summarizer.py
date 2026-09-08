@@ -472,6 +472,16 @@ def summarize_book(
         source = _build_source(plan, by_id, llm, cache, version)
         key = TranslationCache.key(f"lesson:{plan.index}:{source}", llm.model, version)
         cached = cache.get(key)
+        if cached is None:
+            from ebook_translator.core.llm import GOOGLE_AI_FALLBACK_MODELS
+            for alt_m in GOOGLE_AI_FALLBACK_MODELS:
+                if alt_m == llm.model:
+                    continue
+                alt_k = TranslationCache.key(f"lesson:{plan.index}:{source}", alt_m, version)
+                cached = cache.get(alt_k)
+                if cached is not None:
+                    cache.put(key, cached)
+                    break
         if cached is not None:
             lesson = json.loads(cached)
         else:
@@ -594,10 +604,21 @@ def _generate_lesson(
     data = _parse_json(raw)
     errors = _validate_lesson(data)
     if errors:
+        problem_lines = []
+        for e in errors:
+            if e == "JSON did not parse":
+                problem_lines.append(
+                    "Output was not valid JSON. You MUST return ONLY a valid, well-formed JSON object. "
+                    "Escape all quotes inside strings, do not include trailing commas, and ensure all brackets close properly."
+                )
+            else:
+                problem_lines.append(e)
+
         retry_prompt = prompt + (
             "\n\nIMPORTANT: your previous attempt had these problems, fix ALL of them:\n- "
-            + "\n- ".join(errors)
+            + "\n- ".join(problem_lines)
         )
+        print(f"  [thử lại] bài {plan.index} do: {'; '.join(errors)}", file=sys.stderr)
         raw2 = llm.complete(
             system=system,
             messages=[{"role": "user", "content": retry_prompt}],
@@ -609,11 +630,13 @@ def _generate_lesson(
         if not errors2:
             data = data2
         elif data2 is not None and not _fatal_errors(errors2):
-            print(f"  [canh bao] bai {plan.index}: {'; '.join(errors2)}", file=sys.stderr)
+            print(f"  [cảnh báo] bài {plan.index}: {'; '.join(errors2)}", file=sys.stderr)
             data = data2
         elif data is not None and not _fatal_errors(errors):
-            print(f"  [canh bao] bai {plan.index}: {'; '.join(errors)}", file=sys.stderr)
+            print(f"  [cảnh báo] bài {plan.index}: {'; '.join(errors)}", file=sys.stderr)
         else:
+            sample = (raw2 or raw or "")[:400]
+            print(f"  [lỗi JSON bài {plan.index}] Nội dung thô đầu ra:\n{sample}...", file=sys.stderr)
             raise RuntimeError(
                 f"Không sinh được bài {plan.index} ({plan.source_title}): "
                 + "; ".join(errors2 or errors)

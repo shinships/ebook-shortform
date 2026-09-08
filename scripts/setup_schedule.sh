@@ -78,6 +78,11 @@ case "$ACTION" in
             echo "   ⚪ Chưa kích hoạt (Bật bằng: ./scripts/setup_schedule.sh bot-install)"
         fi
         echo ""
+        echo "3️⃣  Radar Sách Mới & High-Rating Tuần Này (Amazon, Goodreads):"
+        echo "   🌟 Tự động đẩy qua Telegram Bot vào Thứ Hai 09:00 hàng tuần"
+        echo "   💡 Kiểm tra nhanh: ./scripts/setup_schedule.sh weekly-dry-run"
+        echo "   🚀 Bắn tin ngay:    ./scripts/setup_schedule.sh weekly-run"
+        echo ""
         echo "═══════════════════════════════════════════════════════════"
         ;;
 
@@ -139,9 +144,20 @@ case "$ACTION" in
         echo "✅ Đã gỡ bỏ Telegram Bot."
         ;;
 
+    # ── Radar Gợi Ý Sách Tuần ──
+    weekly-run)
+        echo "🌟 Kích hoạt gửi bản tin Radar Sách Hay Tuần Này tới Telegram..."
+        "$PROJECT_DIR/.venv-mac/bin/python" "$SCRIPT_DIR/send_weekly_recommendations.py"
+        ;;
+
+    weekly-dry-run)
+        echo "🔍 Xem trước nội dung Radar Sách Hay Tuần Này (không gửi)..."
+        "$PROJECT_DIR/.venv-mac/bin/python" "$SCRIPT_DIR/send_weekly_recommendations.py" --dry-run
+        ;;
+
     *)
         echo "Lựa chọn không hợp lệ: $ACTION"
-        echo "Cách dùng: $0 {status|install-all|schedule-install|schedule-uninstall|bot-install|bot-status|bot-logs|bot-uninstall}"
+        echo "Cách dùng: $0 {status|install-all|schedule-install|schedule-uninstall|bot-install|bot-status|bot-logs|bot-uninstall|weekly-run|weekly-dry-run}"
         exit 1
         ;;
 esac
