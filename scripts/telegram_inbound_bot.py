@@ -441,7 +441,12 @@ class TelegramBookBot:
         if not file_path.exists():
             return False
 
-        data: dict[str, Any] = {"chat_id": chat_id, "supports_streaming": True}
+        data: dict[str, Any] = {
+            "chat_id": chat_id,
+            "supports_streaming": True,
+            "width": 1080,
+            "height": 1920,
+        }
         if caption:
             data["caption"] = caption
             data["parse_mode"] = "HTML"
@@ -3647,6 +3652,18 @@ class TelegramBookBot:
         title = job.get("title") or "Podcast Digest"
         mp3_path = Path(job["mp3_path"])
         script_path = job.get("script_path") or ""
+
+        # KHÔNG render nếu thiếu script gốc (*_script.txt) — nếu để Whisper tự đoán chữ
+        # mà không có ground-truth, phụ đề tiếng Việt sẽ sai chính tả (đã xác nhận qua test thực tế).
+        if not script_path or not Path(script_path).exists():
+            print(f"[Reel] Từ chối render: thiếu script gốc cho {mp3_path.name}", file=sys.stderr)
+            self.send_message(
+                chat_id,
+                f"⚠️ <b>{title}</b>\nTập này chưa có file kịch bản gốc (script.txt) nên chưa thể tạo Video Reel với phụ đề chính xác. Vui lòng thử với tập Podcast khác.",
+                reply_to_message_id=msg_id,
+                thread_id=thread_id,
+            )
+            return
 
         EBOOK_SHORTFORM_ROOT = Path("/Users/mktmda/Projects/ebook-shortform")
         render_script = EBOOK_SHORTFORM_ROOT / "scripts" / "render_short_reel.py"
