@@ -1,0 +1,20 @@
+{
+  "name": "podcast-remotion-renderer",
+  "version": "1.0.0",
+  "description": "Minimalist Remotion template for podcast Reels and Shorts",
+  "scripts": {
+    "build": "remotion bundle",
+    "render": "remotion render ShortVideo"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.218",
+    "@remotion/media-utils": "^4.0.218",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "remotion": "^4.0.218"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "typescript": "^5.4.5"
+  }
+}

@@ -45,5 +45,16 @@ lessons_output/
 .venv-mac/
 .venv-windows-old/
 
+# Remotion & Video Rendering artifacts
+remotion-renderer/node_modules/
+remotion-renderer/.remotion/
+remotion-renderer/out_*.mp4
+remotion-renderer/preview_*.jpg
+remotion-renderer/public/job_*
+remotion-renderer/public/render_*
+/output/reels/*
+!/output/reels/.gitkeep
+
 # Covers are project assets to commit; ignore generated ones if needed
 # /covers/*  <- uncomment to ignore covers
+
