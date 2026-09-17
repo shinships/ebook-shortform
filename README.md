@@ -7,7 +7,7 @@ Dự án gồm các thành phần cốt lõi:
 - **`ebook-translate`** — Dịch toàn bộ ebook tiếng Anh sang tiếng Việt, bảo toàn định dạng HTML/CSS, cấu trúc chương mục và hệ thống thuật ngữ nhất quán.
 - **`ebook-summarize`** — Biên soạn tóm tắt ebook thành "sách hướng dẫn chuyên sâu" kiểu Shortform: mỗi bài 15–25 phút trả lời *vì sao ý tưởng quan trọng → cơ chế hoạt động & case study → góc nhìn mở rộng/đối chiếu → tóm lược điểm cốt lõi → bài tập tự vấn & hành động thực tiễn*.
 - **`auto-pipeline.sh`** — Dây chuyền tự động hóa: theo dõi thư mục `inbox/`, tự động tóm tắt sách, ghi log chi tiết và đẩy thẳng file `.epub` vào Topic Telegram.
-- **`scripts/generate_podcast.py`** — Công cụ CLI sản xuất Audio Podcast/Audiobook: kịch bản đàm thoại solo lôi cuốn biên soạn bởi Gemini và render âm thanh độ phân giải cao 48kHz bằng **VieNeu-TTS v3 Turbo** (mặc định on-device) hoặc Vbee Cloud API.
+- **`scripts/generate_podcast.py`** — Công cụ CLI sản xuất Audio Podcast/Audiobook: kịch bản đàm thoại solo lôi cuốn biên soạn bởi Gemini và render âm thanh độ phân giải cao 48kHz bằng **ZeroTTS** (mặc định CPU real-time), **VieNeu-TTS v3 Turbo** (on-device) hoặc Vbee Cloud API.
 - **`scripts/telegram_inbound_bot.py`** — Dịch vụ Telegram Bot chuyên biệt 24/7 trên macOS (`@ebookshort_bot`), hỗ trợ gửi sách từ điện thoại, tương tác bằng nút bấm 1-chạm (Dịch toàn bộ, Tóm tắt Shortform, Đọc thử chương đầu), Instant 1-Page Brief và quản lý thư viện sách.
 - **`scripts/setup_schedule.sh`** — Bộ công cụ quản trị daemon launchd cho hệ thống bot và lịch xử lý tự động hàng ngày.
 
@@ -79,9 +79,10 @@ TELEGRAM_CHAT_ID="-100xxxxxxxxxx"
 TELEGRAM_TOPIC_ID="365"   # ID của Topic trong Forum Group (nếu có)
 
 # Text-to-Speech (TTS) cho Audio Podcast & Sách nói
-TTS_ENGINE="vieneu"       # "vieneu" (mặc định on-device 48kHz) hoặc "vbee" (Cloud API)
-VIENEU_VOICE="Minh Quân"  # Giọng Host mặc định (Thái Sơn, Anh Khôi, Quỳnh Anh, Ngọc Huyền...)
-# VIENEU_REF_AUDIO="covers/host_sample.wav"  # Tùy chọn: File âm thanh mẫu 3-8s để clone giọng
+TTS_ENGINE="zerotts"       # "zerotts" (mặc định CPU real-time 48kHz), "vieneu" (on-device 48kHz) hoặc "vbee" (Cloud API)
+ZEROTTS_VOICE="maichi"     # Giọng Host mặc định ZeroTTS (maichi, giahuy, baotrang, kimoanh, quangminh, huuduc...)
+VIENEU_VOICE="Minh Quân"   # Giọng Host mặc định VieNeu (Thái Sơn, Anh Khôi, Quỳnh Anh, Ngọc Huyền...)
+# VIENEU_REF_AUDIO="covers/host_sample.wav"  # Tùy chọn: File âm thanh mẫu 3-8s để clone giọng (VieNeu)
 
 # Vbee AIVoice TTS API (dự phòng khi cần dùng Cloud API của Vbee)
 VBEE_APP_ID="your_vbee_app_id"
@@ -235,37 +236,56 @@ Dịch vụ chạy ngầm 24/7 trên macOS biến Telegram (`@ebookshort_bot`) t
 
 ### 4. Tạo Audio Podcast Tóm Tắt Sách (`scripts/generate_podcast.py`)
 
-Quy trình tự động hóa sản xuất nội dung âm thanh từ sách tóm tắt bằng sự kết hợp giữa **Gemini AI** và **VieNeu-TTS v3 Turbo** (mặc định) / **Vbee AIVoice**:
+Quy trình tự động hóa sản xuất nội dung âm thanh từ sách tóm tắt bằng sự kết hợp giữa **Gemini AI** và **ZeroTTS** (mặc định CPU real-time) / **VieNeu-TTS v3 Turbo** / **Vbee AIVoice**:
 
-1. **Biên kịch Podcast thông minh**: Gemini đóng vai trò Host/Producer chuyên nghiệp, phân tích tài liệu tóm tắt và chuyển thể thành **kịch bản nói đơn thoại (Solo Podcast Script)** kéo dài 8–12 phút. Văn phong đàm thoại gần gũi, mở đầu cuốn hút, xâu chuỗi bài học thành câu chuyện liền mạch và đúc kết hành động thực tiễn.
-2. **Chuyển đổi âm thanh chất lượng cao 48kHz (VieNeu v3 Turbo)**: Chạy hoàn toàn on-device (CPU/Apple Silicon hoặc GPU), phát âm tiếng Anh - Việt song ngữ liền mạch (code-switching), không lo giới hạn ký tự và hỗ trợ **Instant Voice Cloning**. (Vẫn hỗ trợ fallback sang Vbee Cloud API nếu muốn).
-3. **Phân phối tức thì**: Tự động xuất file MP3 chuẩn 192kbps (kèm tùy biến tốc độ `atempo`), lưu trữ vào `output/podcasts/` và tùy chọn đẩy thẳng lên kênh/topic Telegram.
+1. **Biên kịch Podcast thông minh**: Gemini đóng vai trò Host/Producer chuyên nghiệp, phân tích tài liệu tóm tắt và chuyển thể thành **kịch bản nói đơn thoại (Solo Podcast Script)** kéo dài 8–12 phút (hoặc bản chuyên sâu 20–30 phút với `--deep`). Văn phong đàm thoại gần gũi, mở đầu cuốn hút, xâu chuỗi bài học thành câu chuyện liền mạch và đúc kết hành động thực tiễn.
+2. **Chuyển đổi âm thanh chất lượng cao 48kHz (ZeroTTS - Mặc định)**:
+   - **Tốc độ thời gian thực trên CPU**: RTF ~ 0.50x, độ trễ chunk đầu tiên chỉ ~70ms mà không cần GPU rời.
+   - **Độ chính xác vượt trội**: WER chỉ **1.03%** (thấp hơn 4 lần so với các mô hình trước), tự động chuẩn hóa ngày tháng, giờ giấc, số tiền, từ viết tắt và đọc từ tiếng Anh mượt mà (code-switching).
+   - **8 giọng đọc tuyển chọn 48kHz**: Phủ đầy đủ các tông giọng (Mai Chi, Bảo Trang, Kim Oanh, Hà My, Gia Huy, Hữu Đức, Quang Minh, Tiến Đạt).
+   - **Cơ chế fallback thông minh**: Tự động chuyển tiếp linh hoạt giữa ZeroTTS ↔ VieNeu-TTS ↔ Vbee Cloud API.
+3. **Phân phối tức thì**: Tự động xuất file MP3 chuẩn 192kbps 48kHz (kèm tùy biến tốc độ `atempo`), lưu trữ vào `output/podcasts/` và tùy chọn đẩy thẳng lên kênh/topic Telegram.
 
 #### Cách sử dụng từ dòng lệnh:
 
 ```bash
-# Xem danh sách giọng đọc hỗ trợ (VieNeu & Vbee)
+# Xem danh sách giọng đọc hỗ trợ (ZeroTTS, VieNeu & Vbee)
 python scripts/generate_podcast.py --list-voices
 
-# Tạo Podcast MP3 bằng VieNeu mặc định và tự động gửi tới Telegram
+# Tạo Podcast MP3 bằng ZeroTTS mặc định (Host Mai Chi) và tự động gửi tới Telegram
 python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --telegram
 
-# Chọn giọng Host bằng tên hoặc alias:
-python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice "Thái Sơn"
-python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice "Anh Khôi"
-python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice "Quỳnh Anh"
+# Chọn giọng Host ZeroTTS bằng tên hoặc alias:
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice maichi       # Mai Chi (Nữ nhẹ nhàng - Mặc định)
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice giahuy       # Gia Huy (Nam trầm ấm)
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice baotrang     # Bảo Trang (Nữ tin tức)
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --voice quangminh    # Quang Minh (Nam dứt khoát)
 
-# Nhân bản giọng nói tức thì (Instant Voice Cloning) từ 1 file mẫu (3-8 giây):
-python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --ref-audio "covers/my_voice.wav"
+# Tạo Podcast Chuyên Sâu (Deep Dive 20-30 phút):
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --deep --voice giahuy
 
-# Tùy chỉnh tốc độ đọc (1.1x, 1.2x, mặc định 1.1):
-python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --speed 1.15
+# Tùy chọn chuyển sang engine VieNeu-TTS (hỗ trợ voice cloning):
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --engine vieneu --voice "Thái Sơn"
+python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --engine vieneu --ref-audio "covers/my_voice.wav"
 
-# Tùy chọn sử dụng Vbee Cloud API thay vì VieNeu:
+# Tùy chọn sử dụng Vbee Cloud API:
 python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub --engine vbee --voice maiphuong
 ```
 
-#### Bảng tra cứu giọng đọc VieNeu tiêu biểu:
+#### Bảng tra cứu giọng đọc ZeroTTS tiêu biểu (48kHz CPU Real-time):
+
+| Mã giọng | Tên Host | Giới tính | Phong cách / Điểm mạnh |
+|:---|:---|:---|:---|
+| `maichi` | **Mai Chi** | Nữ *(Mặc định)* | Trẻ trung, kể chuyện nhẹ nhàng, truyền cảm, phong cách podcast thân thiện |
+| `giahuy` | **Gia Huy** | Nam | Trẻ trung, kể chuyện trầm ấm, sâu lắng, cực kỳ thích hợp cho sách tư duy |
+| `baotrang` | **Bảo Trang** | Nữ | Trưởng thành, tin tức, rõ ràng, trung tính, đọc báo & tài liệu học thuật |
+| `kimoanh` | **Kim Oanh** | Nữ | Trung niên, kể chuyện ấm áp, diễn cảm sâu sắc |
+| `quangminh` | **Quang Minh** | Nam | Trẻ trung, tin tức, rõ ràng, dứt khoát, năng động |
+| `huuduc` | **Hữu Đức** | Nam | Lớn tuổi, kể chuyện trầm, điềm đạm, phong cách cố vấn/chuyên gia |
+| `hamy` | **Hà My** | Nữ | Trẻ trung, âm vực cao, giàu biểu cảm |
+| `tiendat` | **Tiến Đạt** | Nam | Trẻ trung, bình luận, sôi nổi, năng lượng cao |
+
+#### Bảng tra cứu giọng đọc VieNeu tiêu biểu (On-device 48kHz):
 
 | Tên Host / Mã | Vùng miền / Phong cách | Điểm mạnh nổi bật |
 |:---|:---|:---|
@@ -274,10 +294,8 @@ python scripts/generate_podcast.py output/Remote_Office_Not_Required_short.epub 
 | **Anh Khôi** | Nam - Miền Bắc | Sâu lắng, đĩnh đạc, đọc sách kỹ năng & triết lý sống |
 | **Quỳnh Anh** | Nữ - Miền Bắc | Diễn cảm, rõ ràng, giàu cảm xúc |
 | **Ngọc Huyền** | Nữ - Miền Bắc | Tự nhiên, phong cách talkshow/podcast thanh lịch |
-| **Thanh Bình** | Nam - Miền Bắc | Kể chuyện mạch lạc, cuốn hút |
 | **Thục Đoan** | Nữ - Miền Nam | Kể chuyện dịu dàng, êm ái miền Nam |
 | **Quang Sơn** | Nam - Miền Trung (Huế) | Tự nhiên, truyền cảm âm sắc miền Trung |
-| **Trúc Ly** | Nữ - Miền Bắc | Trẻ trung, tươi sáng, nhẹ nhàng |
 
 ---
 

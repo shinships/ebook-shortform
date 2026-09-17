@@ -25,6 +25,11 @@ def write_epub(book: Book, output_path: str) -> None:
     if book.title_translated and book.title:
         # giu title goc lam metadata phu
         eb.add_metadata("DC", "title", book.title, {"id": "original-title"})
+    
+    # Apple Books optimization metadata
+    eb.add_metadata("OPF", "meta", "true", {"property": "ibooks:specified-fonts"})
+    eb.add_metadata("OPF", "meta", "true", {"name": "apple-mobile-web-app-capable"})
+    eb.add_metadata("OPF", "meta", "book", {"property": "ibooks:binding"})
 
     css_content = book.css or DEFAULT_CSS
     css_item = epub.EpubItem(

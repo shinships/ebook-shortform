@@ -141,7 +141,9 @@ def translate_book(
             key = TranslationCache.key(chunk, llm.model, glossary.version)
             translated = cache.get(key)
             if translated is None:
-                translated = _translate_chunk(llm, system, chunk, prev_tail)
+                safe_chunk, placeholders = _hide_complex_tags(chunk)
+                safe_translated = _translate_chunk(llm, system, safe_chunk, prev_tail)
+                translated = _restore_complex_tags(safe_translated, placeholders)
                 cache.put(key, translated)
             translated_parts.append(translated)
             prev_tail = _text_tail(translated)
@@ -150,6 +152,28 @@ def translate_book(
         # thay tieu de trong noi dung bang ban dich (heading dau tien khop title goc)
         if chap.title and chap.title_translated and chap.title != chap.title_translated:
             chap.html = _replace_heading(chap.html, chap.title, chap.title_translated)
+
+
+def _hide_complex_tags(html: str) -> tuple[str, dict[str, str]]:
+    soup = BeautifulSoup(f"<div>{html}</div>", "lxml")
+    placeholders = {}
+    for i, tag in enumerate(soup.find_all(["table", "img", "svg"])):
+        ph_id = f"__AG_PH_{i}__"
+        placeholders[ph_id] = str(tag)
+        ph_tag = soup.new_tag("div", id=ph_id, attrs={"class": "ag-placeholder"})
+        tag.replace_with(ph_tag)
+    return soup.div.decode_contents(), placeholders
+
+
+def _restore_complex_tags(html: str, placeholders: dict[str, str]) -> str:
+    soup = BeautifulSoup(f"<div>{html}</div>", "lxml")
+    for tag in soup.find_all("div", class_="ag-placeholder"):
+        ph_id = tag.get("id")
+        if ph_id in placeholders:
+            ph_soup = BeautifulSoup(placeholders[ph_id], "lxml")
+            if ph_soup.body and ph_soup.body.contents:
+                tag.replace_with(ph_soup.body.contents[0])
+    return soup.div.decode_contents()
 
 
 def _translate_chunk(llm: LLMClient, system: str, chunk: str, prev_tail: str) -> str:

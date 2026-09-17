@@ -158,6 +158,16 @@ print(cleaned if cleaned else stem)
         continue
     fi
 
+    # -- Bỏ qua nếu file vốn đã là file đã xử lý (_short, _shortform, _VN, .vi) --
+    filename_lower=$(echo "$filename" | tr '[:upper:]' '[:lower:]')
+    if [[ "$filename_lower" == *"_short."* || "$filename_lower" == *"_shortform."* || "$filename_lower" == *"_vn."* || "$filename_lower" == *".vi."* || "$filename_lower" == *"_vi."* ]]; then
+        echo "   ⏭️  File đã qua xử lý ($filename), bỏ qua."
+        log_section "$filename"
+        echo "- Trạng thái: ⏭️ file đã xử lý, bỏ qua" >> "$LOG_FILE"
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
+
     # -- Kiểm tra trùng lặp: đã có output chưa? --
     if [[ -f "$OUTPUT/${stem}_short.epub" ]]; then
         echo "   ⏭️  Đã có ${stem}_short.epub trong output/, bỏ qua."

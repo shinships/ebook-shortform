@@ -154,9 +154,13 @@ def main():
             print(f"\n❌ Lỗi khi render Remotion (code {result.returncode})")
             sys.exit(result.returncode)
     finally:
-        # Dọn dẹp props tạm
+        # Dọn dẹp toàn bộ file tạm để tránh phình to thư mục public/
         if props_file.exists():
             props_file.unlink()
+        if target_audio.exists():
+            target_audio.unlink()
+        if target_cover.exists():
+            target_cover.unlink()
 
 if __name__ == "__main__":
     main()

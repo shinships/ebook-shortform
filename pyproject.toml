@@ -16,7 +16,11 @@ dependencies = [
     "lxml>=5.0",
     "Pillow>=10.0",
     "vieneu>=3.6.4",
+    "zerotts>=0.1.2",
     "json-repair>=0.30",
+    "openai>=1.0",
+    "yt-dlp>=2024.0",
+    "faster-whisper>=1.2.1",
 ]
 
 [project.scripts]

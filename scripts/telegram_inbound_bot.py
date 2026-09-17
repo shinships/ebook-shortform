@@ -26,7 +26,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -36,12 +38,36 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "scripts"))
 sys.path.insert(0, str(PROJECT_DIR / "src"))
 
+from ebook_translator.core.article import (
+    ArticleContent,
+    TranslatedArticle,
+    fetch_and_parse_article,
+    generate_article_audio,
+    translate_article,
+)
+from ebook_translator.core.llm import LLMClient
+from ebook_translator.core.tags import format_tags, generate_topic_tags
+from ebook_translator.core.youtube import (
+    extract_time_from_url,
+    format_time_str,
+    get_youtube_chapters,
+    is_youtube_url,
+    youtube_to_article,
+)
 from ebook_translator.recommender import CATEGORIES, SEED_RECOMMENDATIONS, book_recommender
 from generate_podcast import (
+    PODCASTS_DIR,
     POPULAR_VOICES,
+    VIENEU_POPULAR_VOICES,
     VOICE_TO_READER_NAME,
+    ZEROTTS_POPULAR_VOICES,
+    call_tts,
+    call_vieneu_tts,
+    call_zerotts_tts,
     create_podcast_for_book,
+    generate_podcast_script,
     get_reader_name,
+    load_env,
     resolve_voice_code,
 )
 from send_weekly_recommendations import build_recommendations_keyboard
@@ -53,6 +79,7 @@ ORIGINALS_DIR = OUTPUT_DIR / "originals"
 PROCESSING_DIR = PROJECT_DIR / "processing"
 LOGS_DIR = PROJECT_DIR / "logs"
 COVERS_DIR = PROJECT_DIR / "covers"
+ARTICLES_DIR = OUTPUT_DIR / "articles"
 
 VENV_BIN = PROJECT_DIR / ".venv-mac" / "bin"
 VENV_SUMMARIZE = VENV_BIN / "ebook-summarize"
@@ -62,6 +89,7 @@ VENV_PYTHON = VENV_BIN / "python"
 SETTINGS_PATH = LOGS_DIR / ".bot_settings.json"
 SENT_FILES_PATH = LOGS_DIR / ".sent_files.json"
 PENDING_FILES_PATH = LOGS_DIR / ".pending_files.json"
+PENDING_URLS_PATH = LOGS_DIR / ".pending_urls.json"
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
@@ -108,6 +136,25 @@ def clean_book_filename(filename: str) -> str:
     return f"{clean_name}{ext}"
 
 
+@dataclass
+class ProcessResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def render_progress_bar(current: int, total: int, width: int = 10) -> str:
+    """Vẽ thanh trạng thái trực quan dạng [██████░░░░] 60%."""
+    if total <= 0:
+        empty = "░" * width
+        return f"[{empty}] 0%"
+    fraction = min(1.0, max(0.0, current / total))
+    pct = int(fraction * 100)
+    filled = int(round(fraction * width))
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{bar}] {pct}%"
+
+
 class TelegramBookBot:
     def __init__(self):
         self.env = load_env(ENV_PATH)
@@ -138,22 +185,27 @@ class TelegramBookBot:
 
         # Bộ nhớ tạm lưu file đang chờ người dùng bấm nút tương tác (lưu file để bảo toàn khi bot restart)
         self.pending_files: dict[str, dict[str, Any]] = self._load_pending_files()
+        self.pending_urls: dict[str, dict[str, Any]] = self._load_pending_urls()
 
         # Quản lý theo dõi file output được tạo từ máy tính
         self.bot_processed_files: dict[str, float] = {}
         self.sent_files: dict[str, float] = self._load_sent_files()
 
         # Đảm bảo các thư mục cần thiết tồn tại
-        for d in (INBOX_DIR, OUTPUT_DIR, ORIGINALS_DIR, PROCESSING_DIR, LOGS_DIR, COVERS_DIR):
+        for d in (INBOX_DIR, OUTPUT_DIR, ORIGINALS_DIR, PROCESSING_DIR, LOGS_DIR, COVERS_DIR, ARTICLES_DIR):
             d.mkdir(parents=True, exist_ok=True)
 
     # ── 1. Quản lý cài đặt & Cấu hình ──
     def _load_settings(self) -> dict[str, Any]:
+        env = load_env(ENV_PATH)
+        def_engine = os.environ.get("TTS_ENGINE") or env.get("TTS_ENGINE") or "zerotts"
+        def_voice = "maichi" if def_engine == "zerotts" else "Minh Quân"
         default = {
             "default_mode": "ask",  # "ask", "summarize", "translate", "both"
             "model": "gemini-3.7-flash",  # "gemini-3.7-flash", "gemini-2.5-pro"
-            "voice": "Minh Quân",  # Giọng đọc VieNeu AI v3 Turbo mặc định
-            "podcast_speed": 1.1,  # Tốc độ đọc mặc định 1.1x (cho phép 1.1x, 1.2x, 1.3x)
+            "engine": def_engine,  # "zerotts" (CPU 48kHz), "vieneu", "vbee"
+            "voice": def_voice,  # Giọng đọc mặc định (maichi cho ZeroTTS, Minh Quân cho VieNeu)
+            "podcast_speed": 1.15,  # Tốc độ đọc mặc định 1.15x (cho phép 1.1x, 1.15x, 1.2x)
             "weekly_recommendation": {
                 "enabled": True,
                 "day": 0,  # 0: Thứ Hai
@@ -195,6 +247,24 @@ class TelegramBookBot:
             PENDING_FILES_PATH.write_text(json.dumps(self.pending_files, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             print(f"[Pending] Lỗi lưu pending_files: {e}", file=sys.stderr)
+
+    def _load_pending_urls(self) -> dict[str, dict[str, Any]]:
+        if PENDING_URLS_PATH.exists():
+            try:
+                data = json.loads(PENDING_URLS_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    now = time.time()
+                    return {k: v for k, v in data.items() if now - v.get("timestamp", 0) < 172800}
+            except Exception:
+                pass
+        return {}
+
+    def _save_pending_urls(self) -> None:
+        try:
+            PENDING_URLS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            PENDING_URLS_PATH.write_text(json.dumps(self.pending_urls, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            print(f"[Pending] Lỗi lưu pending_urls: {e}", file=sys.stderr)
 
     def _load_sent_files(self) -> dict[str, float]:
         if SENT_FILES_PATH.exists():
@@ -348,8 +418,9 @@ class TelegramBookBot:
         performer: str | None = None,
         reply_to_message_id: int | None = None,
         thread_id: int | str | None = None,
+        thumb: Path | None = None,
     ) -> dict[str, Any] | None:
-        """Gửi file âm thanh MP3 chuẩn Telegram Audio Player (cho phép phát ngầm, 1.5x, 2x)."""
+        """Gửi file âm thanh MP3 chuẩn Telegram Audio Player (cho phép phát ngầm, 1.5x, 2x) kèm ảnh bìa tập."""
         if not file_path.exists():
             print(f"❌ Không tìm thấy file audio: {file_path}", file=sys.stderr)
             return None
@@ -370,19 +441,57 @@ class TelegramBookBot:
         if performer:
             data["performer"] = performer
 
+        # Tự động tìm ảnh bìa nếu chưa truyền vào
+        if thumb is None:
+            clean_stem = (
+                file_path.stem
+                .replace("_podcast_tinh_gon", "")
+                .replace("_podcast_chuyen_sau", "")
+                .replace("_podcast", "")
+                .replace("_audio", "")
+                .replace("_short_short", "")
+                .replace("_short", "")
+            )
+            cand = PODCASTS_DIR / "episode_covers" / f"{clean_stem}.jpg"
+            if cand.exists():
+                thumb = cand
+
         try:
             with open(file_path, "rb") as f:
-                files = {"audio": (file_path.name, f, "audio/mpeg")}
-                resp = requests.post(url, data=data, files=files, timeout=240)
-                res_data = resp.json()
-                if not res_data.get("ok"):
-                    print(f"[Telegram] Lỗi sendAudio: {res_data}", file=sys.stderr)
-                return res_data
+                files: dict[str, Any] = {"audio": (file_path.name, f, "audio/mpeg")}
+                thumb_file = None
+                if thumb and thumb.exists() and thumb.stat().st_size > 0:
+                    try:
+                        thumb_file = open(thumb, "rb")
+                        files["thumbnail"] = (thumb.name, thumb_file, "image/jpeg")
+                    except Exception:
+                        pass
+
+                try:
+                    resp = requests.post(url, data=data, files=files, timeout=240)
+                    res_data = resp.json()
+                    if not res_data.get("ok"):
+                        print(f"[Telegram] Lỗi sendAudio: {res_data}", file=sys.stderr)
+                    return res_data
+                finally:
+                    if thumb_file:
+                        thumb_file.close()
         except Exception as e:
             print(f"[Telegram] Ngoại lệ sendAudio: {e}", file=sys.stderr)
             return None
 
     def download_file(self, file_id: str, dest_path: Path) -> bool:
+        if dest_path.exists() and dest_path.stat().st_size > 0:
+            return True
+        orig = ORIGINALS_DIR / dest_path.name
+        if orig.exists() and orig.stat().st_size > 0:
+            shutil.copy2(str(orig), str(dest_path))
+            return True
+        proc = PROCESSING_DIR / dest_path.name
+        if proc.exists() and proc.stat().st_size > 0:
+            shutil.copy2(str(proc), str(dest_path))
+            return True
+
         try:
             r = requests.get(f"{self.api_url}/getFile", params={"file_id": file_id}, timeout=25)
             res = r.json()
@@ -431,10 +540,10 @@ class TelegramBookBot:
         file_size = doc.get("file_size", 0)
         ext = Path(file_name).suffix.lower()
 
-        if ext not in (".epub", ".pdf"):
+        if ext not in (".epub", ".pdf", ".md", ".markdown", ".txt"):
             self.send_message(
                 chat_id,
-                f"⚠️ Định dạng <code>{ext}</code> chưa được hỗ trợ. Vui lòng gửi file <b>.epub</b> hoặc <b>.pdf</b>.",
+                f"⚠️ Định dạng <code>{ext}</code> chưa được hỗ trợ. Vui lòng gửi file <b>.epub</b>, <b>.pdf</b> hoặc <b>.md</b>.",
                 reply_to_message_id=msg_id,
                 thread_id=thread_id,
             )
@@ -471,10 +580,14 @@ class TelegramBookBot:
             or message.get("forward_sender_name")
         )
 
-        # 2. Phát hiện file ĐÃ ĐƯỢC XỬ LÝ (Tóm tắt _short.epub hoặc Dịch .vi.epub)
+        # 2. Phát hiện file ĐÃ ĐƯỢC XỬ LÝ (Tóm tắt _short.epub / _shortform.epub hoặc Dịch .vi.epub / _VN.epub)
         file_name_lower = file_name.lower()
-        is_already_short = "_short" in file_name_lower
-        is_already_translated = any(tag in file_name_lower for tag in (".vi.", "_vi.", ".vi_")) or file_name_lower.endswith((".vi.epub", "_vi.epub"))
+        is_text_doc = ext in (".md", ".markdown", ".txt")
+        is_already_short = "_short" in file_name_lower or "_shortform" in file_name_lower
+        is_already_translated = (
+            any(tag in file_name_lower for tag in (".vi.", "_vi.", ".vi_", ".vn.", "_vn.", ".vn_"))
+            or file_name_lower.endswith((".vi.epub", "_vi.epub", ".vn.epub", "_vn.epub", "_vn.pdf"))
+        )
         is_already_processed = is_already_short or is_already_translated
 
         # 3. Phân tích Caption
@@ -484,18 +597,34 @@ class TelegramBookBot:
 
         chosen_action: str | None = None
         if caption_lower:
-            if any(w in caption_lower for w in ["podcast", "audio", "nghe", "đọc", "vbee", "vieneu"]):
-                chosen_action = "podcast"
-            elif any(w in caption_lower for w in ["dịch", "dich", "translate", "toàn văn", "full"]):
-                chosen_action = "translate"
-            elif any(w in caption_lower for w in ["tóm tắt", "tom tat", "shortform", "summary", "brief"]):
-                chosen_action = "summarize"
-            elif any(w in caption_lower for w in ["cả hai", "ca hai", "both", "all"]):
-                chosen_action = "both"
-            elif any(w in caption_lower for w in ["thử", "thu", "preview", "sample"]):
-                chosen_action = "preview"
+            if is_text_doc:
+                if any(w in caption_lower for w in ["podcast sâu", "chuyên sâu", "deep", "deepdive", "podcast dài"]):
+                    chosen_action = "pod_deep"
+                elif any(w in caption_lower for w in ["podcast tinh gọn", "tinh gọn", "quick"]):
+                    chosen_action = "pod_quick"
+                elif any(w in caption_lower for w in ["audio", "nghe", "đọc", "voice", "toàn văn", "mp3"]):
+                    chosen_action = "pod_direct"
+                elif any(w in caption_lower for w in ["podcast"]):
+                    chosen_action = "pod_quick"
+                elif any(w in caption_lower for w in ["dịch", "dich", "translate"]):
+                    chosen_action = "translate"
+                elif any(w in caption_lower for w in ["tóm tắt", "tom tat", "shortform", "summary", "brief"]):
+                    chosen_action = "summarize"
+            else:
+                if any(w in caption_lower for w in ["podcast sâu", "chuyên sâu", "deep", "deepdive", "podcast dài"]):
+                    chosen_action = "pod_deep"
+                elif any(w in caption_lower for w in ["podcast", "audio", "nghe", "đọc", "vbee", "vieneu", "tinh gọn"]):
+                    chosen_action = "pod_quick"
+                elif any(w in caption_lower for w in ["dịch", "dich", "translate", "toàn văn", "full"]):
+                    chosen_action = "translate"
+                elif any(w in caption_lower for w in ["tóm tắt", "tom tat", "shortform", "summary", "brief"]):
+                    chosen_action = "summarize"
+                elif any(w in caption_lower for w in ["cả hai", "ca hai", "both", "all"]):
+                    chosen_action = "both"
+                elif any(w in caption_lower for w in ["thử", "thu", "preview", "sample"]):
+                    chosen_action = "preview"
 
-        # BẢO VỆ: Nếu file được FORWARD hoặc ĐÃ QUA XỬ LÝ (_short.epub, .vi.epub),
+        # BẢO VỆ: Nếu file được FORWARD hoặc ĐÃ QUA XỬ LÝ (_short.epub, _shortform.epub, .vi.epub, _VN.epub),
         # TUYỆT ĐỐI KHÔNG tự động áp dụng default_mode! Luôn hiện menu để người dùng chọn.
         if not chosen_action and not is_forwarded and not is_already_processed:
             default_mode = self.settings.get("default_mode", "ask")
@@ -505,22 +634,35 @@ class TelegramBookBot:
         # Nếu đã xác định được action rõ ràng:
         if chosen_action:
             action_names = {
-                "podcast": "🎙️ Tạo Audio Podcast (VieNeu AI)",
-                "summarize": "⚡ Tóm tắt Shortform",
+                "podcast": "🎙️ Tạo Podcast Tinh Gọn",
+                "pod_quick": "🎙️ Tạo Podcast Tinh Gọn",
+                "pod_deep": "🎙️ Tạo Podcast Chuyên Sâu",
+                "pod_direct": "🎙️ Đọc Audio Toàn Văn (MP3 48kHz)",
+                "summarize": "📝 Tóm tắt Shortform",
                 "translate": "📖 Dịch toàn bộ sách",
                 "both": "🚀 Cả Dịch & Tóm tắt",
-                "preview": "👁️ Đọc thử 1 chương dịch",
+                "preview": "👁️ Đọc thử 1 chương",
+            }
+            job_types = {
+                "podcast": "podcast_book_quick",
+                "pod_quick": "podcast_book_quick",
+                "pod_deep": "podcast_book_deep",
+                "pod_direct": "podcast_book_direct",
+                "summarize": "summarize_book",
+                "translate": "translate_book",
+                "both": "both",
+                "preview": "preview_book",
             }
             desc = action_names.get(chosen_action, chosen_action)
             ack_msg = (
-                f"📥 <b>Đã nhận sách:</b> <code>{file_name}</code> ({size_str})\n"
+                f"📥 <b>Đã nhận tài liệu:</b> <code>{file_name}</code> ({size_str})\n"
                 f"🎯 <b>Tác vụ tự động:</b> {desc}\n"
                 f"⏳ Đang tải file về máy và đưa vào hàng đợi xử lý..."
             )
             self.send_message(chat_id, ack_msg, reply_to_message_id=msg_id, thread_id=thread_id)
 
             self.job_queue.put({
-                "type": f"{chosen_action}_book" if chosen_action != "both" else "both",
+                "type": job_types.get(chosen_action, f"{chosen_action}_book"),
                 "action": chosen_action,
                 "file_id": file_id,
                 "file_name": file_name,
@@ -545,19 +687,41 @@ class TelegramBookBot:
         self._save_pending_files()
 
         # Menu 1-chạm tùy chỉnh thông minh theo loại file
-        if is_already_short or is_already_processed:
+        if is_text_doc:
+            # Menu chuyên biệt cho file Markdown / Text
+            inline_keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "🎙️ Đọc Toàn Văn", "callback_data": f"pod_direct:{file_token}"},
+                    ],
+                    [
+                        {"text": "🎙️ Podcast Tinh Gọn", "callback_data": f"pod_quick:{file_token}"},
+                        {"text": "🎙️ Podcast Chuyên Sâu", "callback_data": f"pod_deep:{file_token}"},
+                    ],
+                ]
+            }
+            prompt_text = (
+                f"📄 <b>Đã nhận tài liệu:</b> <code>{file_name}</code> ({size_str})\n"
+                f"✨ <i>Định dạng Markdown / Text</i>\n\n"
+                f"🎯 <b>Chọn định dạng âm thanh bạn muốn tạo:</b>\n\n"
+                f"• 🎙️ <b>Đọc Toàn Văn:</b> Đọc trọn vẹn 100% từng câu chữ của tài liệu bằng giọng AI 48kHz (không tóm tắt hay cắt gọt).\n\n"
+                f"• 🎙️ <b>Podcast Tinh Gọn (8–12p):</b> AI cô đọng các ý chính cốt lõi thành bản audio ngắn gọn, dễ nghe.\n\n"
+                f"• 🎙️ <b>Podcast Chuyên Sâu (20–30p):</b> AI mổ xẻ chi tiết luận điểm, cơ chế và phản biện theo phong cách thảo luận chuyên sâu."
+            )
+        elif is_already_short or is_already_processed:
             # Menu chuyên biệt cho file ĐÃ TÓM TẮT / ĐÃ DỊCH
             inline_keyboard = {
                 "inline_keyboard": [
                     [
-                        {"text": "🎙️ Tạo Audio Podcast (VieNeu AI)", "callback_data": f"pod:{file_token}"},
-                        {"text": "⚡ Tóm tắt nhanh 1 trang", "callback_data": f"quick:{file_token}"},
+                        {"text": "🎙️ Podcast Tinh Gọn", "callback_data": f"pod_quick:{file_token}"},
+                        {"text": "🎙️ Podcast Chuyên Sâu", "callback_data": f"pod_deep:{file_token}"},
                     ],
                     [
+                        {"text": "📝 Tóm tắt nhanh 1 trang", "callback_data": f"quick:{file_token}"},
                         {"text": "🧠 Hỏi đáp phản biện (/ask)", "callback_data": f"ask:{file_token}"},
-                        {"text": "📖 Dịch sang tiếng Việt", "callback_data": f"trans:{file_token}"},
                     ],
                     [
+                        {"text": "📖 Dịch sang tiếng Việt", "callback_data": f"trans:{file_token}"},
                         {"text": "🔄 Tóm tắt lại từ đầu", "callback_data": f"sum:{file_token}"},
                     ],
                 ]
@@ -568,8 +732,9 @@ class TelegramBookBot:
                 f"📥 <b>Đã nhận sách:</b> <code>{file_name}</code> ({size_str}){origin_note}\n"
                 f"✨ <i>Đây là {status_tag}.</i>\n\n"
                 f"🎯 <b>Chọn tác vụ bạn muốn thực hiện:</b>\n"
-                f"• 🎙️ <b>Tạo Audio Podcast:</b> Kịch bản đối thoại hấp dẫn, đọc bằng giọng AI VieNeu 48kHz.\n"
-                f"• ⚡ <b>Tóm tắt nhanh:</b> Đọc bản tóm tắt điều hành 1 trang ngay trong chat.\n"
+                f"• 🎙️ <b>Podcast Tinh Gọn (8–12p):</b> Nắm bắt nhanh luận đề và 2–3 bài học cốt lõi.\n"
+                f"• 🎙️ <b>Podcast Chuyên Sâu (20–30p):</b> Phân tích chi tiết cơ chế, phản biện đa chiều và ma trận hành động.\n"
+                f"• 📝 <b>Tóm tắt nhanh:</b> Đọc bản tóm tắt điều hành 1 trang ngay trong chat.\n"
                 f"• 🧠 <b>Hỏi đáp:</b> Đặt câu hỏi phản biện với nội dung cuốn sách."
             )
         else:
@@ -577,16 +742,20 @@ class TelegramBookBot:
             inline_keyboard = {
                 "inline_keyboard": [
                     [
-                        {"text": "⚡ Tóm tắt Shortform (3–5p)", "callback_data": f"sum:{file_token}"},
-                        {"text": "🎙️ Tóm tắt & Làm Podcast", "callback_data": f"sum_pod:{file_token}"},
+                        {"text": "📝 Tóm tắt Shortform", "callback_data": f"sum:{file_token}"},
+                        {"text": "📖 Dịch toàn bộ", "callback_data": f"trans:{file_token}"},
                     ],
                     [
-                        {"text": "📖 Dịch toàn bộ (~20p)", "callback_data": f"trans:{file_token}"},
+                        {"text": "🎙️ Podcast Tinh Gọn", "callback_data": f"pod_quick:{file_token}"},
+                        {"text": "🎙️ Podcast Chuyên Sâu", "callback_data": f"pod_deep:{file_token}"},
+                    ],
+                    [
+                        {"text": "📝🎙️ Tóm tắt + Pod Gọn", "callback_data": f"sum_pod:{file_token}"},
+                        {"text": "📝🎙️ Tóm tắt + Pod Sâu", "callback_data": f"sum_deep_pod:{file_token}"},
+                    ],
+                    [
                         {"text": "🚀 Cả Dịch & Tóm tắt", "callback_data": f"both:{file_token}"},
-                    ],
-                    [
                         {"text": "👁️ Đọc thử 1 chương", "callback_data": f"prev:{file_token}"},
-                        {"text": "🎙️ Chỉ làm Audio Podcast", "callback_data": f"pod:{file_token}"},
                     ],
                 ]
             }
@@ -595,10 +764,248 @@ class TelegramBookBot:
                 f"📥 <b>Đã nhận sách:</b> <code>{file_name}</code> ({size_str}){origin_note}\n"
                 f"👤 <b>Người gửi:</b> {sender_name}\n\n"
                 f"🎯 <b>Vui lòng chọn tác vụ xử lý bạn muốn:</b>\n"
-                f"• <b>Tóm tắt Shortform:</b> Trích xuất luận đề, 3 trụ cột & Shortform Notes.\n"
-                f"• <b>Tóm tắt & Làm Podcast:</b> Xuất bản cả EPUB tóm tắt và file Audio MP3 nghe luôn.\n"
-                f"• <b>Dịch toàn bộ sách:</b> Dịch toàn văn giữ nguyên hình ảnh, thuật ngữ glossary.\n"
-                f"• <b>Đọc thử 1 chương:</b> Dịch mẫu chương đầu để kiểm tra văn phong."
+                f"• 📝 <b>Tóm tắt Shortform:</b> Trích xuất luận đề, 3 trụ cột & Shortform Notes (EPUB).\n"
+                f"• 📖 <b>Dịch toàn bộ sách:</b> Dịch toàn văn giữ nguyên hình ảnh, thuật ngữ glossary.\n"
+                f"• 🎙️ <b>Podcast Tinh Gọn (8–12p):</b> Audio cô đọng ý tưởng lớn, phù hợp nghe nhanh.\n"
+                f"• 🎙️ <b>Podcast Chuyên Sâu (20–30p):</b> Masterclass mổ xẻ toàn diện cơ chế & phản biện.\n"
+                f"• 📝🎙️ <b>Tóm tắt + Podcast:</b> Vừa tạo sách EPUB tóm tắt vừa tạo Audio Podcast.\n"
+                f"• 👁️ <b>Đọc thử 1 chương:</b> Dịch mẫu chương đầu để kiểm tra văn phong."
+            )
+
+        self.send_message(
+            chat_id,
+            prompt_text,
+            reply_to_message_id=msg_id,
+            thread_id=thread_id,
+            reply_markup=inline_keyboard,
+        )
+
+    @staticmethod
+    def extract_url_from_message(msg: dict[str, Any] | None) -> str | None:
+        """Trích xuất đường dẫn URL (YouTube / web) từ tin nhắn hoặc tin nhắn được reply."""
+        if not msg:
+            return None
+        # 1. Tìm URL trong text hoặc caption
+        for text_source in (msg.get("text") or "", msg.get("caption") or ""):
+            urls = re.findall(r"https?://[^\s<>\"']+", text_source)
+            if urls:
+                return urls[0].strip().rstrip(".,;!?)<>\"'")
+        # 2. Tìm trong entities / caption_entities
+        entities = (msg.get("entities") or []) + (msg.get("caption_entities") or [])
+        for ent in entities:
+            if ent.get("type") == "text_link" and ent.get("url"):
+                return ent["url"].strip().rstrip(".,;!?)<>\"'")
+        # 3. Đệ quy kiểm tra reply_to_message nếu có
+        if msg.get("reply_to_message"):
+            return TelegramInboundBot.extract_url_from_message(msg["reply_to_message"])
+        return None
+
+    # ── 3b. Tiếp nhận và phân tích liên kết bài viết (URL) ──
+    def handle_incoming_url(self, message: dict[str, Any], url: str) -> None:
+        chat = message.get("chat", {})
+        from_user = message.get("from", {})
+        chat_id = chat.get("id")
+        msg_id = message.get("message_id")
+        thread_id = message.get("message_thread_id")
+
+        if not self.is_authorized(from_user, chat):
+            self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+            return
+
+        first_name = from_user.get("first_name", "")
+        last_name = from_user.get("last_name", "")
+        sender_name = f"{first_name} {last_name}".strip() or from_user.get("username") or "Bạn đọc"
+
+        url = url.strip().rstrip(".,;!?)")
+        text_raw = (message.get("text") or message.get("caption") or "").lower()
+        is_yt = is_youtube_url(url)
+
+        # Nhận diện mốc thời gian / chapter nếu là YouTube
+        yt_start: str | None = None
+        yt_end: str | None = None
+        yt_chapter: str | None = None
+
+        if is_yt:
+            # 1. Khoảng thời gian: "45:48-53:04", "45:48 - 53:04", "45:48 đến 53:04", "10:00 to 20:00"
+            range_m = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:-|–|—|đến|to)\s*(\d{1,2}:\d{2}(?::\d{2})?)", text_raw)
+            if range_m:
+                yt_start = range_m.group(1)
+                yt_end = range_m.group(2)
+            else:
+                # 2. Chapter: "ch 8", "ch8", "chapter 8", "chương 8"
+                ch_m = re.search(r"(?:chapter|chương|ch)\s*(\d+)", text_raw)
+                if ch_m:
+                    yt_chapter = ch_m.group(1)
+                else:
+                    # 3. Mốc đơn lẻ: "từ 45:48", "từ 2748", "start 45:48", "mốc 45:48"
+                    single_m = re.search(r"(?:từ|start|bắt đầu|mốc)\s*(\d{1,2}:\d{2}(?::\d{2})?|\d+s?)", text_raw)
+                    if single_m:
+                        yt_start = single_m.group(1)
+
+            # 4. Nếu không có mốc trong văn bản, kiểm tra URL có param t= không
+            if not yt_start and not yt_chapter:
+                url_t = extract_time_from_url(url)
+                if url_t and url_t > 0:
+                    yt_start = format_time_str(url_t)
+
+        seg_desc = ""
+        if yt_chapter:
+            seg_desc = f" (Chương {yt_chapter})"
+        elif yt_start and yt_end:
+            seg_desc = f" (Đoạn {yt_start} - {yt_end})"
+        elif yt_start:
+            seg_desc = f" (Từ {yt_start})"
+
+        # Phân tích ý định từ văn bản đi kèm
+        has_audio = any(w in text_raw for w in ["audio", "podcast", "nghe", "đọc", "voice", "phát âm"])
+        has_trans = any(w in text_raw for w in ["dịch", "dich", "translate", "vietsub", "tiếng việt"])
+        has_sum = any(w in text_raw for w in ["tóm tắt", "tom tat", "shortform", "summary", "brief"])
+        has_deep = any(w in text_raw for w in ["sâu", "deep", "chuyên sâu", "deepdive", "podcast sâu", "podcast"])
+
+        chosen_action: str | None = None
+        if has_deep and has_audio:
+            chosen_action = "yt_pod_deep" if is_yt else "art_sum_pod"
+        elif has_trans and has_audio:
+            chosen_action = "art_trans_pod"
+        elif has_sum and has_audio:
+            chosen_action = "art_sum_pod"
+        elif has_trans:
+            chosen_action = "art_trans"
+        elif has_sum:
+            chosen_action = "art_sum"
+        elif has_audio:
+            chosen_action = "art_trans_pod"
+
+        action_names = {
+            "art_trans_pod": "🎙️ Đọc Toàn Văn",
+            "art_trans": "📝 Bản Dịch Chữ",
+            "art_sum_pod": "🎙️ Podcast Tinh Gọn",
+            "art_sum": "📝 Tóm tắt ngắn",
+            "yt_pod_deep": "🎙️ Podcast Phân Tích",
+        }
+        job_types = {
+            "art_trans_pod": "article_translate_audio",
+            "art_trans": "article_translate",
+            "art_sum_pod": "article_summarize_audio",
+            "art_sum": "article_summarize",
+            "yt_pod_deep": "article_yt_podcast_deep",
+        }
+
+        # Nếu đã có chỉ định rõ ràng qua lệnh hoặc từ khóa
+        if chosen_action:
+            desc = action_names[chosen_action]
+            source_label = "video YouTube" if is_yt else "bài viết"
+            ack_msg = (
+                f"{'📺' if is_yt else '🌐'} <b>Đã nhận liên kết {source_label}:</b> <code>{url}</code>\n"
+                f"🎯 <b>Tác vụ tự động:</b> {desc}{seg_desc}\n"
+                f"⏳ Đang {'trích xuất phụ đề' if is_yt else 'tải nội dung bài viết'} và đưa vào hàng đợi xử lý..."
+            )
+            self.send_message(chat_id, ack_msg, reply_to_message_id=msg_id, thread_id=thread_id)
+            self.job_queue.put({
+                "type": job_types[chosen_action],
+                "action": chosen_action,
+                "url": url,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "msg_id": msg_id,
+                "sender_name": sender_name,
+                "start_time": yt_start,
+                "end_time": yt_end,
+                "chapter": yt_chapter,
+            })
+            return
+
+        # Nếu chỉ dán link trống: Tạo token và hiển thị menu tương tác 1-chạm
+        url_token = uuid.uuid4().hex[:8]
+        self.pending_urls[url_token] = {
+            "url": url,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "msg_id": msg_id,
+            "sender_name": sender_name,
+            "timestamp": time.time(),
+            "start_time": yt_start,
+            "end_time": yt_end,
+            "chapter": yt_chapter,
+        }
+        self._save_pending_urls()
+
+        parsed_url = urllib.parse.urlparse(url)
+        domain = parsed_url.netloc.replace("www.", "")
+
+        # Menu riêng cho YouTube vs Bài viết thường
+        if is_yt:
+            chapters = []
+            try:
+                chapters = get_youtube_chapters(url)
+            except Exception:
+                pass
+
+            buttons = [
+                [
+                    {"text": f"🎙️ Đọc Toàn Văn{seg_desc}", "callback_data": f"art_trans_pod:{url_token}"},
+                ],
+                [
+                    {"text": f"🎙️ Podcast Phân Tích{seg_desc}", "callback_data": f"yt_pod_deep:{url_token}"},
+                ],
+                [
+                    {"text": f"📝 Bản Dịch Chữ{seg_desc}", "callback_data": f"art_trans:{url_token}"},
+                ],
+            ]
+            if chapters and not (yt_chapter or yt_start):
+                buttons.append([
+                    {"text": f"📑 Chọn Chapter ({len(chapters)} chương)", "callback_data": f"yt_ch_list:{url_token}"}
+                ])
+            elif chapters:
+                buttons.append([
+                    {"text": f"📑 Đổi Chapter khác ({len(chapters)} chương)", "callback_data": f"yt_ch_list:{url_token}"}
+                ])
+
+            inline_keyboard = {"inline_keyboard": buttons}
+            prompt_text = (
+                f"📺 <b>TIẾP NHẬN VIDEO YOUTUBE</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔗 <b>Đường dẫn:</b> <code>{url}</code>\n"
+                f"📡 <b>Nguồn:</b> <code>{domain}</code>\n"
+            )
+            if seg_desc:
+                prompt_text += f"⏱️ <b>Phân đoạn:</b> <code>{seg_desc.strip(' ()')}</code>\n"
+            elif chapters:
+                prompt_text += f"📑 <b>Video có {len(chapters)} Chapters</b> (Có thể bấm chọn chương bên dưới)\n"
+
+            prompt_text += (
+                f"\n🎧 <b>Chọn định dạng bạn muốn tạo:</b>\n\n"
+                f"• 🎙️ <b>Đọc Toàn Văn:</b> Dịch và đọc trọn vẹn 100% phụ đề bằng giọng AI 48kHz.\n\n"
+                f"• 🎙️ <b>Podcast Phân Tích:</b> AI chắt lọc luận điểm cốt lõi và đúc kết thành buổi đàm thoại podcast lôi cuốn.\n\n"
+                f"• 📝 <b>Bản Dịch Chữ:</b> Chỉ dịch phụ đề sang tiếng Việt (văn bản)."
+            )
+            if not seg_desc:
+                prompt_text += (
+                    f"\n\n💡 <i>Mẹo: Gửi link kèm mốc (VD: <code>{url} 45:48-53:04</code> hoặc <code>ch8</code>) để cắt nhanh!</i>"
+                )
+        else:
+            inline_keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "🎙️ Đọc Toàn Văn", "callback_data": f"art_trans_pod:{url_token}"},
+                    ],
+                    [
+                        {"text": "🎙️ Podcast Tinh Gọn", "callback_data": f"art_sum_pod:{url_token}"},
+                    ],
+                    [
+                        {"text": "📝 Bản Dịch Chữ", "callback_data": f"art_trans:{url_token}"},
+                    ],
+                ]
+            }
+            prompt_text = (
+                f"🌐 <b>TIẾP NHẬN BÀI VIẾT TỪ LIÊN KẾT</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔗 <b>Đường dẫn:</b> <code>{url}</code>\n"
+                f"📡 <b>Nguồn:</b> <code>{domain}</code>\n\n"
+                f"🎧 <b>Chọn định dạng bạn muốn tạo:</b>\n\n"
+                f"• 🎙️ <b>Đọc Toàn Văn:</b> Dịch và đọc trọn vẹn 100% bài viết bằng giọng AI 48kHz.\n\n"
+                f"• 🎙️ <b>Podcast Tinh Gọn:</b> AI cô đọng các ý chính quan trọng nhất thành bản audio ngắn gọn dễ nghe.\n\n"
+                f"• 📝 <b>Bản Dịch Chữ:</b> Chỉ dịch bài viết sang tiếng Việt (văn bản)."
             )
 
         self.send_message(
@@ -626,16 +1033,176 @@ class TelegramBookBot:
             self.send_message(chat_id, "🔒 Bạn chưa có quyền thực hiện thao tác này.", thread_id=thread_id)
             return
 
-        # ── Trường hợp chọn tác vụ cho file đang chờ: sum / trans / both / prev ──
+        # ── Trường hợp chọn tác vụ cho file đang chờ hoặc link bài viết ──
         if ":" in data:
             action_code, token = data.split(":", 1)
+
+            # A. Xử lý bài viết từ liên kết URL
+            article_action_map = {
+                "art_trans_pod": ("article_translate_audio", "🎙️ Đọc Toàn Văn"),
+                "art_trans": ("article_translate", "📝 Bản Dịch Chữ"),
+                "art_sum_pod": ("article_summarize_audio", "🎙️ Podcast Tinh Gọn"),
+                "art_sum": ("article_summarize", "📝 Tóm tắt ngắn"),
+                "yt_pod_deep": ("article_yt_podcast_deep", "🎙️ Podcast Phân Tích"),
+            }
+            if action_code in article_action_map:
+                job_type, action_desc = article_action_map[action_code]
+                info = self.pending_urls.get(token)
+                if not info:
+                    self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn. Vui lòng gửi lại link!", show_alert=True)
+                    self.edit_message_text(
+                        chat_id,
+                        msg_id,
+                        "⚠️ <i>Yêu cầu này đã hết hạn. Vui lòng gửi lại liên kết bài viết!</i>",
+                        reply_markup={"inline_keyboard": []},
+                    )
+                    return
+
+                self.answer_callback_query(query_id, text=f"✅ Đã nhận: {action_desc}!")
+                target_url = info["url"]
+                seg_info = ""
+                if info.get("chapter"):
+                    ch_title_desc = f": {info['chapter_title']}" if info.get("chapter_title") else ""
+                    seg_info = f"\n⏱️ <b>Phân đoạn:</b> Chương {info['chapter']}{ch_title_desc}"
+                elif info.get("start_time") and info.get("end_time"):
+                    seg_info = f"\n⏱️ <b>Phân đoạn:</b> {info['start_time']} - {info['end_time']}"
+                elif info.get("start_time"):
+                    seg_info = f"\n⏱️ <b>Phân đoạn:</b> Từ {info['start_time']}"
+
+                updated_text = (
+                    f"🌐 <b>Liên kết:</b> <code>{target_url}</code>{seg_info}\n"
+                    f"✅ <b>Đã chọn:</b> {action_desc}\n"
+                    f"⏳ Đang tải nội dung và đưa vào hàng đợi xử lý..."
+                )
+                self.edit_message_text(chat_id, msg_id, updated_text, reply_markup={"inline_keyboard": []})
+                self.job_queue.put({
+                    "type": job_type,
+                    "action": action_code,
+                    "url": target_url,
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "msg_id": msg_id,
+                    "sender_name": info.get("sender_name", "Bạn đọc"),
+                    "start_time": info.get("start_time"),
+                    "end_time": info.get("end_time"),
+                    "chapter": info.get("chapter"),
+                    "chapter_title": info.get("chapter_title"),
+                })
+                return
+
+            # Xử lý xem danh sách chapters của video YouTube
+            if action_code == "yt_ch_list":
+                info = self.pending_urls.get(token)
+                if not info:
+                    self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
+                    return
+                self.answer_callback_query(query_id, text="📑 Đang tải danh sách Chapter...")
+                chapters = get_youtube_chapters(info["url"])
+                if not chapters:
+                    self.answer_callback_query(query_id, text="ℹ️ Video này không có Chapters sẵn.", show_alert=True)
+                    return
+
+                ch_buttons = []
+                for idx, ch in enumerate(chapters[:18], 1):
+                    st = format_time_str(ch.get("start_time", 0))
+                    title_clean = ch.get("title", f"Chương {idx}").strip()
+                    title_short = (title_clean[:22] + "…") if len(title_clean) > 22 else title_clean
+                    btn_text = f"[{idx:02d}] {st} {title_short}"
+                    ch_buttons.append([{"text": btn_text, "callback_data": f"yt_ch_pick:{token}_{idx}"}])
+
+                ch_buttons.append([{"text": "🔙 Quay lại menu chính", "callback_data": f"yt_back:{token}"}])
+
+                self.edit_message_text(
+                    chat_id,
+                    msg_id,
+                    f"📑 <b>Chọn Chapter bạn muốn xử lý:</b>\n"
+                    f"🔗 <code>{info['url']}</code>\n"
+                    f"📊 <i>Tổng cộng {len(chapters)} chương. Bấm vào một chương để xử lý:</i>",
+                    reply_markup={"inline_keyboard": ch_buttons},
+                )
+                return
+
+            # Xử lý khi bấm chọn một chapter cụ thể
+            if action_code == "yt_ch_pick":
+                if "_" in token:
+                    url_tok, ch_num_str = token.rsplit("_", 1)
+                else:
+                    url_tok, ch_num_str = token, "1"
+                info = self.pending_urls.get(url_tok)
+                if not info:
+                    self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
+                    return
+
+                # Lấy tên chapter thực tế từ metadata
+                ch_title = f"Chương {ch_num_str}"
+                try:
+                    chapters = get_youtube_chapters(info["url"])
+                    ch_idx_int = int(ch_num_str) if ch_num_str.isdigit() else 1
+                    if 1 <= ch_idx_int <= len(chapters):
+                        raw_t = chapters[ch_idx_int - 1].get("title", ch_title).strip()
+                        from ebook_translator.core.youtube import clean_chapter_raw_title
+                        ch_title = clean_chapter_raw_title(raw_t)
+                except Exception:
+                    pass
+
+                info["chapter"] = ch_num_str
+                info["chapter_title"] = ch_title
+                self._save_pending_urls()
+
+                self.answer_callback_query(query_id, text=f"✅ Đã chọn Chapter {ch_num_str}!")
+
+                seg_label = f" (Chương {ch_num_str})"
+                inline_keyboard = {
+                    "inline_keyboard": [
+                        [{"text": f"🎙️ Đọc Toàn Văn{seg_label}", "callback_data": f"art_trans_pod:{url_tok}"}],
+                        [{"text": f"🎙️ Podcast Phân Tích{seg_label}", "callback_data": f"yt_pod_deep:{url_tok}"}],
+                        [{"text": f"📝 Bản Dịch Chữ{seg_label}", "callback_data": f"art_trans:{url_tok}"}],
+                        [{"text": "🔙 Chọn lại Chapter", "callback_data": f"yt_ch_list:{url_tok}"}],
+                    ]
+                }
+                display_ch = f"Chương {ch_num_str}: {ch_title}" if ch_title and ch_title != f"Chương {ch_num_str}" else f"Chương {ch_num_str}"
+                self.edit_message_text(
+                    chat_id,
+                    msg_id,
+                    f"📺 <b>TIẾP NHẬN VIDEO YOUTUBE</b>\n"
+                    f"🔗 <code>{info['url']}</code>\n"
+                    f"🎯 <b>Phân đoạn đã chọn:</b> <code>{display_ch}</code>\n\n"
+                    f"🎧 <b>Chọn định dạng muốn tạo:</b>",
+                    reply_markup=inline_keyboard,
+                )
+                return
+
+            if action_code == "yt_back":
+                info = self.pending_urls.get(token)
+                if not info:
+                    self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
+                    return
+                self.answer_callback_query(query_id)
+                
+                fake_msg = dict(message)
+                fake_msg["from"] = from_user
+                fake_msg["message_id"] = info.get("msg_id", message.get("message_id"))
+                fake_msg["text"] = info["url"]
+                
+                try:
+                    requests.post(f"{self.api_url}/deleteMessage", json={"chat_id": chat_id, "message_id": message.get("message_id")}, timeout=10)
+                except Exception:
+                    pass
+                
+                self.handle_incoming_url(fake_msg, info["url"])
+                return
+
             action_map = {
-                "sum": ("summarize_book", "⚡ Tóm tắt Shortform chuyên sâu"),
+                "sum": ("summarize_book", "📝 Tóm tắt Shortform"),
                 "trans": ("translate_book", "📖 Dịch toàn bộ sách"),
                 "both": ("both", "🚀 Cả Dịch & Tóm tắt sách"),
-                "prev": ("preview_book", "👁️ Đọc thử 1 chương dịch"),
-                "pod": ("podcast_book", "🎙️ Tạo Audio Podcast (VieNeu AI)"),
-                "sum_pod": ("sum_and_pod", "⚡🎙️ Tóm tắt & Tạo Audio Podcast"),
+                "prev": ("preview_book", "👁️ Đọc thử 1 chương"),
+                "pod": ("podcast_book_quick", "🎙️ Podcast Tinh Gọn"),
+                "pod_quick": ("podcast_book_quick", "🎙️ Podcast Tinh Gọn"),
+                "pod_deep": ("podcast_book_deep", "🎙️ Podcast Chuyên Sâu"),
+                "pod_direct": ("podcast_book_direct", "🎙️ Đọc Audio Toàn Văn"),
+                "sum_pod": ("sum_and_pod_quick", "📝🎙️ Tóm tắt + Pod Gọn"),
+                "sum_deep_pod": ("sum_and_pod_deep", "📝🎙️ Tóm tắt + Pod Sâu"),
             }
 
             if action_code in action_map:
@@ -699,10 +1266,10 @@ class TelegramBookBot:
                 self.job_queue.put({
                     "type": job_type,
                     "action": action_code,
-                    "file_id": info["file_id"],
+                    "file_id": info.get("file_id"),
                     "file_name": file_name,
-                    "chat_id": chat_id,
-                    "thread_id": thread_id,
+                    "chat_id": info.get("chat_id", chat_id),
+                    "thread_id": info.get("thread_id", thread_id),
                     "msg_id": info.get("msg_id", msg_id),
                     "sender_name": info.get("sender_name", "Bạn đọc"),
                 })
@@ -733,17 +1300,87 @@ class TelegramBookBot:
                 )
                 return
 
+            # ── Trường hợp chọn model: setmodel:<model> ──
+            elif action_code == "setmodel":
+                new_model = token
+                self.settings["model"] = new_model
+                self._save_settings()
+                self.answer_callback_query(query_id, text=f"Đã đổi model: {new_model}")
+                self.edit_message_text(
+                    chat_id,
+                    msg_id,
+                    f"🧠 <b>Mô hình AI hiện tại:</b>\n👉 <code>{new_model}</code>",
+                    reply_markup={"inline_keyboard": []},
+                )
+                return
+
+
+            # ── Trường hợp chọn Engine: setengine:<engine> ──
+            elif action_code == "setengine":
+                new_engine = token.lower().strip()
+                self.settings["engine"] = new_engine
+                if new_engine == "zerotts":
+                    if self.settings.get("voice") not in ZEROTTS_POPULAR_VOICES:
+                        self.settings["voice"] = "maichi"
+                    eng_label = "⚡ ZeroTTS (48kHz Real-Time CPU)"
+                elif new_engine == "vieneu":
+                    if self.settings.get("voice") not in VIENEU_POPULAR_VOICES:
+                        self.settings["voice"] = "Minh Quân"
+                    eng_label = "🦜 VieNeu-TTS v3 Turbo (48kHz)"
+                else:
+                    self.settings["voice"] = "hn_female_maiphuong_vdts_48k-fhg"
+                    eng_label = "☁️ Vbee AIVoice (Cloud)"
+                self._save_settings()
+                curr_voice = self.settings.get("voice")
+                r_name = get_reader_name(curr_voice, engine=new_engine)
+                self.answer_callback_query(query_id, text=f"✅ Đã chọn engine: {eng_label}")
+                self.edit_message_text(
+                    chat_id,
+                    msg_id,
+                    f"⚙️ <b>Đã chuyển TTS Engine sang:</b> <b>{eng_label}</b>\n"
+                    f"🗣️ <b>Host mặc định:</b> {r_name} (<code>{curr_voice}</code>)\n\n"
+                    f"💡 <i>Gõ <code>/voice</code> để đổi giọng đọc hoặc <code>/speed</code> để chỉnh tốc độ!</i>",
+                    reply_markup={"inline_keyboard": []},
+                )
+                return
+
+            # ── Trường hợp mở menu chọn engine: cmd_engine ──
+            elif action_code == "cmd_engine":
+                curr_engine = self.settings.get("engine", "zerotts")
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": f"{'✅ ' if curr_engine == 'zerotts' else ''}⚡ ZeroTTS (48kHz CPU, WER 1%)", "callback_data": "setengine:zerotts"}],
+                        [{"text": f"{'✅ ' if curr_engine == 'vieneu' else ''}🦜 VieNeu-TTS (48kHz On-device)", "callback_data": "setengine:vieneu"}],
+                        [{"text": f"{'✅ ' if curr_engine == 'vbee' else ''}☁️ Vbee AIVoice (Cloud API)", "callback_data": "setengine:vbee"}],
+                    ]
+                }
+                self.answer_callback_query(query_id)
+                self.edit_message_text(
+                    chat_id,
+                    msg_id,
+                    "⚙️ <b>CHỌN CÔNG NGHỆ GIỌNG ĐỌC AI (TTS ENGINE)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nBấm chọn engine bạn muốn dùng làm mặc định:",
+                    reply_markup=keyboard,
+                )
+                return
+
             # ── Trường hợp chọn giọng đọc Podcast: setvoice:<voice> ──
             elif action_code == "setvoice":
                 new_voice = token
                 self.settings["voice"] = new_voice
+                if new_voice in ZEROTTS_POPULAR_VOICES:
+                    self.settings["engine"] = "zerotts"
+                elif new_voice in VIENEU_POPULAR_VOICES:
+                    self.settings["engine"] = "vieneu"
                 self._save_settings()
-                r_name = get_reader_name(new_voice)
-                self.answer_callback_query(query_id, text=f"✅ Đã chọn giọng: {r_name}")
+                curr_eng = self.settings.get("engine", "zerotts")
+                r_name = get_reader_name(new_voice, engine=curr_eng)
+                eng_name = "ZeroTTS 48kHz" if curr_eng == "zerotts" else ("VieNeu 48kHz" if curr_eng == "vieneu" else "Vbee Cloud")
+                self.answer_callback_query(query_id, text=f"✅ Đã chọn giọng: {r_name} ({eng_name})")
                 self.edit_message_text(
                     chat_id,
                     msg_id,
-                    f"🗣️ <b>Đã chuyển Host Podcast sang:</b> <b>{r_name}</b> (<code>{new_voice}</code>)\n\n"
+                    f"🗣️ <b>Đã chuyển Host Podcast sang:</b> <b>{r_name}</b> (<code>{new_voice}</code>)\n"
+                    f"⚙️ <b>Công nghệ:</b> <code>{eng_name}</code>\n\n"
                     f"💡 <i>Từ bây giờ, các tập Audio Podcast sẽ do Host {r_name} thể hiện!</i>",
                     reply_markup={"inline_keyboard": []},
                 )
@@ -752,11 +1389,11 @@ class TelegramBookBot:
             # ── Trường hợp chọn tốc độ đọc Podcast: setspeed:<speed> ──
             elif action_code == "setspeed":
                 try:
-                    new_speed = round(float(token), 1)
+                    new_speed = round(float(token), 2)
                 except ValueError:
-                    new_speed = 1.1
-                if new_speed not in (1.1, 1.2, 1.3):
-                    new_speed = 1.1
+                    new_speed = 1.15
+                if new_speed not in (1.1, 1.15, 1.2):
+                    new_speed = 1.15
                 self.settings["podcast_speed"] = new_speed
                 self._save_settings()
                 self.answer_callback_query(query_id, text=f"⚡ Đã đổi tốc độ: {new_speed}x")
@@ -769,11 +1406,41 @@ class TelegramBookBot:
                 )
                 return
 
+            # ── Trường hợp làm mới Private RSS: refresh_rss_feed ──
+            elif action_code in ("refresh_rss_feed", "refresh_feed") or data == "refresh_rss_feed":
+                try:
+                    from ebook_translator.core.podcast_rss import update_podcast_feed, scan_podcast_episodes
+                    update_podcast_feed()
+                    eps = scan_podcast_episodes()
+                    self.answer_callback_query(query_id, text=f"✅ Đã làm mới Feed ({len(eps)} tập)!", show_alert=True)
+                except Exception as e:
+                    self.answer_callback_query(query_id, text=f"Lỗi: {e}", show_alert=True)
+                return
+
+            # ── Trường hợp xem file log lỗi: errlog:<token> ──
+            elif action_code == "errlog":
+                log_file = LOGS_DIR / f"error_{token}.log"
+                if log_file.exists():
+                    self.answer_callback_query(query_id, text="Đang tải file log...")
+                    self.send_document(chat_id, log_file, caption="📋 <b>Chi tiết lỗi hệ thống</b>", thread_id=thread_id)
+                else:
+                    self.answer_callback_query(query_id, text="⚠️ File log không tồn tại hoặc đã bị xóa.", show_alert=True)
+                return
+
             # ── Trường hợp tóm tắt nhanh 1 trang: quick:<token> ──
             elif action_code == "quick":
                 info = self.pending_files.get(token)
                 fname = info.get("file_name", "") if info else ""
-                stem = Path(fname).stem.replace("_short", "").replace(".vi", "")
+                stem = (
+                    Path(fname).stem
+                    .replace("_shortform", "")
+                    .replace("_short", "")
+                    .replace(".vi", "")
+                    .replace("_vi", "")
+                    .replace("_vn", "")
+                    .replace("_VN", "")
+                    .replace(".vn", "")
+                )
                 self.answer_callback_query(query_id, text="⚡ Đang tải bản tóm tắt 1 trang...")
                 analyses = list(OUTPUT_DIR.glob(f"*{stem}*.analysis.json"))
                 if analyses:
@@ -931,8 +1598,40 @@ class TelegramBookBot:
             self.handle_incoming_document(message)
             return
 
+        # ── Xử lý khi người dùng gửi ảnh làm Cover Podcast ──
+        photos = message.get("photo")
+        caption = (message.get("caption") or "").strip()
+        if photos and any(k in caption.lower() for k in ("/cover", "/set_cover", "ảnh bìa", "anh bia")):
+            if not self.is_authorized(from_user, chat):
+                self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+                return
+            file_id = photos[-1]["file_id"]
+            tmp_path = LOGS_DIR / f"temp_cover_{int(time.time())}.jpg"
+            if self.download_file(file_id, tmp_path):
+                try:
+                    from generate_podcast_cover import save_custom_cover_image
+                    save_custom_cover_image(tmp_path)
+                    tmp_path.unlink(missing_ok=True)
+                    self.send_message(
+                        chat_id,
+                        "🎨 <b>ĐÃ CẬP NHẬT ẢNH BÌA PODCAST THÀNH CÔNG!</b>\n\n"
+                        "✨ Ảnh đã được tự động cắt vuông tâm & chuẩn hóa 1400x1400 chuẩn Apple Podcasts.\n"
+                        "🚗 Apple Podcasts và CarPlay sẽ tự động hiển thị ảnh bìa mới này!",
+                        reply_to_message_id=msg_id,
+                        thread_id=thread_id,
+                    )
+                except Exception as e:
+                    self.send_message(chat_id, f"❌ Lỗi xử lý ảnh: {e}", reply_to_message_id=msg_id, thread_id=thread_id)
+            return
+
         text = (message.get("text") or "").strip()
         if not text:
+            return
+
+        # ── Xử lý khi tin nhắn chứa link bài viết (URL) ──
+        urls = re.findall(r"https?://[^\s<>\"']+", text)
+        if urls:
+            self.handle_incoming_url(message, urls[0])
             return
 
         # ── Xử lý khi người dùng Reply bằng chữ (ví dụ: "tóm tắt", "dịch", "1", "2") ──
@@ -942,15 +1641,19 @@ class TelegramBookBot:
             if not doc and reply_msg.get("reply_to_message"):
                 doc = reply_msg.get("reply_to_message", {}).get("document")
 
-            if doc and doc.get("file_name", "").lower().endswith((".epub", ".pdf")):
+            if doc and doc.get("file_name", "").lower().endswith((".epub", ".pdf", ".md", ".markdown", ".txt")):
                 if not self.is_authorized(from_user, chat):
                     self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
                     return
 
                 txt_lower = text.lower()
                 chosen = None
-                if any(w in txt_lower for w in ["podcast", "audio", "nghe", "đọc", "vbee", "vieneu"]):
-                    chosen = "podcast"
+                if any(w in txt_lower for w in ["toàn văn", "đọc toàn văn", "doc toan van", "đọc hết", "doc het"]):
+                    chosen = "pod_direct"
+                elif any(w in txt_lower for w in ["podcast sâu", "chuyên sâu", "deep", "deepdive", "podcast dài"]):
+                    chosen = "pod_deep"
+                elif any(w in txt_lower for w in ["podcast", "audio", "nghe", "đọc", "vbee", "vieneu", "tinh gọn"]):
+                    chosen = "pod_direct" if doc.get("file_name", "").lower().endswith((".md", ".markdown", ".txt")) else "pod_quick"
                 elif any(w in txt_lower for w in ["tóm tắt", "tom tat", "shortform", "summary", "brief", "1"]):
                     chosen = "summarize"
                 elif any(w in txt_lower for w in ["dịch", "dich", "translate", "2"]):
@@ -963,11 +1666,24 @@ class TelegramBookBot:
                 if chosen:
                     file_name = clean_book_filename(doc["file_name"])
                     action_descs = {
-                        "podcast": "🎙️ Tạo Audio Podcast (VieNeu AI)",
-                        "summarize": "⚡ Tóm tắt Shortform",
+                        "pod_direct": "🎙️ Đọc Audio Toàn Văn (MP3 48kHz)",
+                        "pod_quick": "🎙️ Tạo Podcast Tinh Gọn",
+                        "pod_deep": "🎙️ Tạo Podcast Chuyên Sâu",
+                        "podcast": "🎙️ Tạo Podcast Tinh Gọn",
+                        "summarize": "📝 Tóm tắt Shortform",
                         "translate": "📖 Dịch toàn bộ sách",
                         "both": "🚀 Cả Dịch & Tóm tắt",
                         "preview": "👁️ Đọc thử 1 chương",
+                    }
+                    job_types = {
+                        "pod_direct": "podcast_book_direct",
+                        "pod_quick": "podcast_book_quick",
+                        "pod_deep": "podcast_book_deep",
+                        "podcast": "podcast_book_quick",
+                        "summarize": "summarize_book",
+                        "translate": "translate_book",
+                        "both": "both",
+                        "preview": "preview_book",
                     }
                     self.send_message(
                         chat_id,
@@ -976,7 +1692,7 @@ class TelegramBookBot:
                         thread_id=thread_id,
                     )
                     self.job_queue.put({
-                        "type": f"{chosen}_book" if chosen != "both" else "both",
+                        "type": job_types.get(chosen, f"{chosen}_book"),
                         "action": chosen,
                         "file_id": doc["file_id"],
                         "file_name": file_name,
@@ -986,6 +1702,15 @@ class TelegramBookBot:
                         "sender_name": sender_name,
                     })
                     return
+
+            # 2. Reply vào tin nhắn chứa liên kết YouTube hoặc bài viết
+            reply_url = self.extract_url_from_message(reply_msg)
+            if reply_url:
+                if not self.is_authorized(from_user, chat):
+                    self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+                    return
+                self.handle_incoming_url(message, reply_url)
+                return
 
         if not text.startswith("/"):
             return
@@ -998,9 +1723,10 @@ class TelegramBookBot:
         if cmd in ("/start", "/menu", "/help"):
             active_model = self.settings.get("model", "gemini-3.7-flash")
             active_mode = self.settings.get("default_mode", "ask")
+            curr_engine = self.settings.get("engine", "zerotts")
             voice_code = self.settings.get("voice")
-            reader_name = get_reader_name(voice_code)
-            podcast_speed = self.settings.get("podcast_speed", 1.1)
+            reader_name = get_reader_name(voice_code, engine=curr_engine)
+            podcast_speed = self.settings.get("podcast_speed", 1.15)
             mode_name = {
                 "ask": "Hỏi qua nút bấm (Interactive)",
                 "summarize": "Tự động Tóm tắt Shortform",
@@ -1012,18 +1738,26 @@ class TelegramBookBot:
                 "📚 <b>TRỢ LÝ DỊCH THUẬT, TÓM TẮT & PODCAST SÁCH AI</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 "Chào bạn! Bot chuyên biệt 100% cho việc tiếp nhận, dịch thuật, tóm tắt chuyên sâu và tạo Audio Podcast bằng giọng đọc AI VieNeu v3 Turbo (48kHz).\n\n"
-                "📖 <b>1. CÁCH GỬI SÁCH ĐỂ XỬ LÝ:</b>\n"
+                "🌐 <b>1. DỊCH BÀI VIẾT & TẠO AUDIO TỪ LINK:</b>\n"
+                "• Chỉ cần <b>dán link bài báo / blog</b> bất kỳ vào chat (Substack, Medium, TechCrunch, Paul Graham...).\n"
+                "• Bot sẽ cung cấp menu 1-chạm để: <b>🎙️ Dịch toàn văn & Tạo Audio MP3 (48kHz)</b>, <b>📖 Dịch bài viết</b>, hoặc <b>⚡🎙️ Tóm tắt & Podcast</b>!\n"
+                "• Hoặc gõ lệnh: <code>/article &lt;link bài viết&gt;</code>\n\n"
+                "📖 <b>2. CÁCH GỬI SÁCH ĐỂ XỬ LÝ:</b>\n"
                 "• Gửi hoặc forward file <code>.epub</code> / <code>.pdf</code> vào chat này.\n"
                 "• Bot sẽ hiển thị <b>menu nút bấm 1-chạm</b> để bạn chọn ngay:\n"
                 "  ⚡ <b>Tóm tắt Shortform:</b> Luận đề cốt lõi, 3 trụ cột, Shortform Notes & Heuristics.\n"
-                "  🎙️ <b>Tạo Audio Podcast:</b> Kịch bản đối thoại sinh động, đọc bằng giọng AI VieNeu 48kHz.\n"
+                "  ⚡🎙️ <b>Podcast Tinh Gọn (8–12p):</b> Kịch bản cô đọng 2-3 ý tưởng lớn, nghe nhanh tiện lợi.\n"
+                "  🧠🎙️ <b>Podcast Chuyên Sâu (20–30p):</b> Masterclass bẻ khóa cơ chế, phản biện đa chiều.\n"
                 "  📖 <b>Dịch toàn bộ sách:</b> Dịch trung thực toàn văn kèm thuật ngữ glossary chuẩn.\n"
                 "  🚀 <b>Cả Dịch & Tóm tắt:</b> Xuất bản cả 2 file EPUB hoàn chỉnh.\n"
                 "  👁️ <b>Đọc thử 1 chương:</b> Dịch mẫu chương đầu để kiểm tra chất lượng văn phong.\n\n"
-                "🛠️ <b>2. CÁC LỆNH TÍNH NĂNG NỔI BẬT:</b>\n"
-                "• <code>/podcast &lt;tên sách&gt;</code> — 🎙️ Tạo Audio Podcast (hoặc Reply file sách và gõ /podcast).\n"
+                "🛠️ <b>3. CÁC LỆNH TÍNH NĂNG NỔI BẬT:</b>\n"
+                "• <code>/article &lt;link&gt;</code> — 🌐 Dịch bài viết từ link web & tạo audio đọc toàn văn.\n"
+                "• <code>/podcast &lt;tên sách&gt;</code> — ⚡🎙️ Tạo <b>Podcast Tinh Gọn</b> (8–12p).\n"
+                "• <code>/podcast_deep &lt;tên sách&gt;</code> — 🧠🎙️ Tạo <b>Podcast Chuyên Sâu</b> (20–30p).\n"
                 "• <code>/voice</code> — 🗣️ Chọn giọng đọc AI cho Podcast (Minh Quân, Thái Sơn, Anh Khôi, Quỳnh Anh...).\n"
-                "• <code>/speed</code> — ⚡ Cài đặt tốc độ đọc Podcast (1.1x, 1.2x, 1.3x).\n"
+                "• <code>/speed</code> — ⚡ Cài đặt tốc độ đọc Podcast (1.1x, 1.15x, 1.2x).\n"
+                "• <code>/rss</code> — 🚗 Link Private RSS & Hướng dẫn nghe trên Apple CarPlay.\n"
                 "• <code>/recommend</code> — 🌟 Radar sách mới & High-rating tuần này (Amazon, Goodreads).\n"
                 "• <code>/wishlist</code> — 📌 Danh sách sách muốn đọc đã lưu lại.\n"
                 "• <code>/library</code> — Mở Thư viện sách đã xử lý (xem & tải lại ngay).\n"
@@ -1031,7 +1765,7 @@ class TelegramBookBot:
                 "• <code>/glossary &lt;tên sách&gt;</code> — Tra cứu bảng thuật ngữ song ngữ Anh - Việt.\n"
                 "• <code>/ask &lt;câu hỏi&gt;</code> — Reply file sách và hỏi đáp phản biện với nội dung.\n"
                 "• <code>/mode</code> — Cài đặt chế độ xử lý mặc định khi nhận file.\n"
-                "• <code>/model</code> — Chọn mô hình AI (Gemini Flash / Gemini Pro).\n"
+                "• <code>/model</code> — Chọn mô hình AI (Gemini / DeepSeek).\n"
                 "• <code>/status</code> — Kiểm tra hàng đợi và trạng thái máy Mac.\n\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"⚙️ Chế độ: <b>{mode_name}</b> | Host: <b>{reader_name}</b> (⚡ {podcast_speed}x) | Model: <code>{active_model}</code>\n"
@@ -1040,14 +1774,226 @@ class TelegramBookBot:
             self.send_message(chat_id, menu_text, reply_to_message_id=msg_id, thread_id=thread_id)
             return
 
+        # ── /rss, /feed, /podcast_feed, /carplay ──
+        elif cmd in ("/rss", "/feed", "/podcast_feed", "/carplay"):
+            if not self.is_authorized(from_user, chat):
+                self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+                return
+
+            try:
+                from ebook_translator.core.podcast_rss import (
+                    get_apple_podcasts_url,
+                    get_base_url,
+                    get_feed_url,
+                    get_local_ip,
+                    scan_podcast_episodes,
+                    update_podcast_feed,
+                )
+                update_podcast_feed()
+                episodes = scan_podcast_episodes()
+                feed_url = get_feed_url()
+                apple_url = get_apple_podcasts_url()
+                base_url = get_base_url()
+                local_ip = get_local_ip()
+
+                rss_msg = (
+                    "🚗 <b>KÊNH PODCAST APPLE CARPLAY (PRIVATE RSS)</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"🎧 Kênh: <b>Sách Nói &amp; Podcast Tóm Tắt (AI)</b>\n"
+                    f"📚 Tổng số tập hiện có: <b>{len(episodes)} tập</b>\n"
+                    f"🌐 Server LAN: <code>{local_ip}:8000</code>\n\n"
+                    f"📡 <b>Đường Link RSS Feed:</b>\n"
+                    f"<code>{feed_url}</code>\n\n"
+                    "📱 <b>CÁCH THÊM VÀO APPLE PODCASTS (1 LẦN DUY NHẤT):</b>\n"
+                    "1️⃣ Kết nối iPhone vào cùng <b>Wi-Fi ở nhà</b> với máy Mac.\n"
+                    "2️⃣ Mở app <b>Apple Podcasts (Podcast)</b> trên iPhone.\n"
+                    "3️⃣ Vào tab <b>Thư viện (Library)</b> ➔ Bấm nút <b>...</b> góc trên bên phải.\n"
+                    "4️⃣ Chọn <b>'Theo dõi chương trình bằng URL...'</b> (Follow a Show by URL).\n"
+                    "5️⃣ Dán link RSS ở trên vào ➔ Bấm <b>Theo dõi</b>.\n\n"
+                    "🚘 <i>Khi lên xe, mở Apple CarPlay: Tất cả các tập sách nói/podcast sẽ hiển thị đầy đủ trên màn hình xe, tua bài 15s/30s bằng phím vô-lăng và tự nhớ đoạn nghe dở!</i>"
+                )
+
+                keyboard = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "🎧 Mở Apple Podcasts", "url": apple_url},
+                            {"text": "🌐 Web Dashboard", "url": f"{base_url}/"},
+                        ],
+                        [
+                            {"text": "🔄 Làm mới Feed", "callback_data": "refresh_rss_feed"},
+                        ],
+                    ]
+                }
+
+                self.send_message(
+                    chat_id,
+                    rss_msg,
+                    reply_to_message_id=msg_id,
+                    thread_id=thread_id,
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                self.send_message(
+                    chat_id,
+                    f"❌ Lỗi khi tạo Private RSS Feed: {e}",
+                    reply_to_message_id=msg_id,
+                    thread_id=thread_id,
+                )
+            return
+
+        # ── /cover hoặc /set_cover (khi reply ảnh hoặc hướng dẫn) ──
+        elif cmd in ("/cover", "/set_cover", "/podcast_cover"):
+            if not self.is_authorized(from_user, chat):
+                self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+                return
+
+            reply_msg = message.get("reply_to_message", {})
+            reply_photos = reply_msg.get("photo") if reply_msg else None
+            if reply_photos:
+                file_id = reply_photos[-1]["file_id"]
+                tmp_path = LOGS_DIR / f"temp_cover_{int(time.time())}.jpg"
+                if self.download_file(file_id, tmp_path):
+                    try:
+                        from generate_podcast_cover import save_custom_cover_image
+                        save_custom_cover_image(tmp_path)
+                        tmp_path.unlink(missing_ok=True)
+                        self.send_message(
+                            chat_id,
+                            "🎨 <b>ĐÃ CẬP NHẬT ẢNH BÌA PODCAST THÀNH CÔNG!</b>\n\n"
+                            "✨ Ảnh đã được tự động cắt vuông tâm & chuẩn hóa 1400x1400 chuẩn Apple Podcasts.\n"
+                            "🚗 Apple Podcasts và CarPlay sẽ tự động hiển thị ảnh bìa mới này!",
+                            reply_to_message_id=msg_id,
+                            thread_id=thread_id,
+                        )
+                    except Exception as e:
+                        self.send_message(chat_id, f"❌ Lỗi xử lý ảnh: {e}", reply_to_message_id=msg_id, thread_id=thread_id)
+                return
+
+            # Nếu không reply ảnh, hiển thị hướng dẫn
+            guide_cover = (
+                "🎨 <b>HƯỚNG DẪN TÙY CHỈNH HÌNH ĐẠI DIỆN PODCAST</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Có 3 cách cực kỳ dễ dàng để đổi hình đại diện:\n\n"
+                "1️⃣ <b>Gửi ảnh trực tiếp qua Telegram:</b>\n"
+                "• Gửi 1 tấm ảnh bất kỳ vào chat này kèm chú thích (caption) là: <code>/cover</code>\n"
+                "• Hoặc reply vào tấm ảnh bất kỳ đã có trong chat và gõ: <code>/cover</code>\n"
+                "<i>(Bot sẽ tự động cắt vuông tâm và chuẩn hóa 1400x1400 sắc nét cho Apple Podcasts)</i>\n\n"
+                "2️⃣ <b>Chép đè file ảnh trên máy Mac:</b>\n"
+                "• Chép ảnh bạn muốn dùng vào đường dẫn: <code>output/podcasts/cover.jpg</code>\n\n"
+                "3️⃣ <b>Dùng dòng lệnh tự động sinh:</b>\n"
+                "• <code>python scripts/generate_podcast_cover.py --image /duong/dan/anh.jpg</code>\n"
+                "• Hoặc sinh ảnh đồ họa: <code>python scripts/generate_podcast_cover.py --title 'Tên Kênh' --author 'Tên Bạn'</code>"
+            )
+            self.send_message(chat_id, guide_cover, reply_to_message_id=msg_id, thread_id=thread_id)
+            return
+
+        # ── /podcast_title hoặc /channel_title ──
+        elif cmd in ("/podcast_title", "/channel_title", "/title_podcast"):
+            if not self.is_authorized(from_user, chat):
+                self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+                return
+
+            from ebook_translator.core.podcast_rss import get_channel_metadata, set_channel_metadata, update_podcast_feed
+            if not arg:
+                meta = get_channel_metadata()
+                self.send_message(
+                    chat_id,
+                    f"🏷️ <b>Tên kênh Podcast hiện tại:</b>\n<b>{meta['title']}</b>\n\n"
+                    f"💡 Để đổi tên, gõ kèm tên mới, ví dụ:\n"
+                    f"<code>/podcast_title Sách Nói Tinh Hoa</code>",
+                    reply_to_message_id=msg_id,
+                    thread_id=thread_id,
+                )
+                return
+
+            meta = set_channel_metadata(title=arg)
+            try:
+                from generate_podcast_cover import generate_branded_cover
+                generate_branded_cover(title=arg)
+            except Exception:
+                pass
+            update_podcast_feed()
+            self.send_message(
+                chat_id,
+                f"✅ <b>ĐÃ ĐỔI TÊN KÊNH PODCAST THÀNH:</b>\n<b>{meta['title']}</b>\n\n"
+                f"📡 Feed XML và ảnh bìa đã được cập nhật tự động!",
+                reply_to_message_id=msg_id,
+                thread_id=thread_id,
+            )
+            return
+
+        # ── /podcast_author hoặc /podcast_host ──
+        elif cmd in ("/podcast_author", "/podcast_host"):
+            if not self.is_authorized(from_user, chat):
+                self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+                return
+
+            from ebook_translator.core.podcast_rss import get_channel_metadata, set_channel_metadata, update_podcast_feed
+            if not arg:
+                meta = get_channel_metadata()
+                self.send_message(
+                    chat_id,
+                    f"👤 <b>Tác giả / Host Podcast hiện tại:</b>\n<b>{meta['author']}</b>\n\n"
+                    f"💡 Để đổi tác giả, gõ kèm tên mới, ví dụ:\n"
+                    f"<code>/podcast_author Bùi Tấn Việt</code>",
+                    reply_to_message_id=msg_id,
+                    thread_id=thread_id,
+                )
+                return
+
+            meta = set_channel_metadata(author=arg)
+            try:
+                from generate_podcast_cover import generate_branded_cover
+                generate_branded_cover(author=arg)
+            except Exception:
+                pass
+            update_podcast_feed()
+            self.send_message(
+                chat_id,
+                f"✅ <b>ĐÃ ĐỔI TÁC GIẢ / HOST PODCAST THÀNH:</b>\n<b>{meta['author']}</b>\n\n"
+                f"📡 Feed XML và ảnh bìa đã được cập nhật tự động!",
+                reply_to_message_id=msg_id,
+                thread_id=thread_id,
+            )
+            return
+
+        # ── /article, /url, /dich ──
+        elif cmd in ("/article", "/url", "/dich"):
+            if not arg:
+                reply_url = self.extract_url_from_message(reply_msg) if reply_msg else None
+                if reply_url:
+                    self.handle_incoming_url(message, reply_url)
+                    return
+                self.send_message(
+                    chat_id,
+                    "💡 <b>Cách dùng:</b> <code>/article &lt;link bài viết&gt;</code>\n"
+                    "Ví dụ: <code>/article https://paulgraham.com/foundermode.html</code>\n\n"
+                    "Hoặc bạn chỉ cần <b>dán thẳng link</b> vào chat, bot sẽ tự động nhận diện và cung cấp nút bấm Dịch & Tạo Audio!",
+                    reply_to_message_id=msg_id,
+                    thread_id=thread_id,
+                )
+                return
+            urls = re.findall(r"https?://[^\s<>\"']+", arg)
+            if urls:
+                self.handle_incoming_url(message, urls[0])
+            else:
+                self.send_message(
+                    chat_id,
+                    "❌ Không tìm thấy đường dẫn hợp lệ. Vui lòng gửi link bắt đầu bằng <code>http://</code> hoặc <code>https://</code>!",
+                    reply_to_message_id=msg_id,
+                    thread_id=thread_id,
+                )
+            return
+
         # ── /status ──
         elif cmd == "/status":
             q_size = self.job_queue.qsize()
             active_model = self.settings.get("model", "gemini-3.7-flash")
             active_mode = self.settings.get("default_mode", "ask")
+            curr_engine = self.settings.get("engine", "zerotts")
             voice_code = self.settings.get("voice")
-            reader_name = get_reader_name(voice_code)
-            podcast_speed = self.settings.get("podcast_speed", 1.1)
+            reader_name = get_reader_name(voice_code, engine=curr_engine)
+            podcast_speed = self.settings.get("podcast_speed", 1.15)
 
             rec_cfg = self.settings.get("weekly_recommendation", {})
             rec_enabled = rec_cfg.get("enabled", True)
@@ -1057,6 +2003,8 @@ class TelegramBookBot:
             short_count = len([f for f in OUTPUT_DIR.glob("*_short.epub") if not f.name.startswith(".")])
             trans_count = len([f for f in OUTPUT_DIR.glob("*.vi.epub") if not f.name.startswith(".")])
             pod_count = len([f for f in (PROJECT_DIR / "output" / "podcasts").glob("*.mp3")]) if (PROJECT_DIR / "output" / "podcasts").exists() else 0
+            art_count = len([f for f in (OUTPUT_DIR / "articles").glob("*.md")]) if (OUTPUT_DIR / "articles").exists() else 0
+            art_pod_count = len([f for f in (OUTPUT_DIR / "articles").glob("*.mp3")]) if (OUTPUT_DIR / "articles").exists() else 0
 
             status_text = (
                 f"🟢 <b>HỆ THỐNG ĐANG HOẠT ĐỘNG BÌNH THƯỜNG</b>\n"
@@ -1071,7 +2019,8 @@ class TelegramBookBot:
                 f"📊 <b>Thống kê Thư viện hiện tại:</b>\n"
                 f"⚡ Sách Tóm tắt Shortform: <b>{short_count}</b> cuốn\n"
                 f"📖 Sách Dịch toàn văn: <b>{trans_count}</b> cuốn\n"
-                f"🎙️ Tập Audio Podcast: <b>{pod_count}</b> tập"
+                f"🎙️ Tập Audio Podcast sách: <b>{pod_count}</b> tập\n"
+                f"🌐 Bài viết dịch từ Link: <b>{art_count}</b> bài (🎙️ <b>{art_pod_count}</b> audio)"
             )
             self.send_message(chat_id, status_text, reply_to_message_id=msg_id, thread_id=thread_id)
             return
@@ -1119,19 +2068,17 @@ class TelegramBookBot:
             )
             return
 
-        # ── /model ──
         elif cmd == "/model":
             if not self.is_authorized(from_user, chat):
                 self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
                 return
-
-            if arg.lower() in ("flash", "pro", "gemini-3.7-flash", "gemini-2.5-pro"):
-                model_name = "gemini-3.7-flash" if "flash" in arg.lower() else "gemini-2.5-pro"
-                self.settings["model"] = model_name
+                
+            if arg:
+                self.settings["model"] = arg.strip()
                 self._save_settings()
                 self.send_message(
                     chat_id,
-                    f"✅ Đã cấu hình Model LLM sang: <code>{model_name}</code>",
+                    f"✅ Đã đổi mô hình AI sang: <b>{arg.strip()}</b>",
                     reply_to_message_id=msg_id,
                     thread_id=thread_id,
                 )
@@ -1140,25 +2087,33 @@ class TelegramBookBot:
             keyboard = {
                 "inline_keyboard": [
                     [
-                        {"text": "⚡ Gemini 3.7 Flash (Siêu nhanh, chuẩn)", "callback_data": "setmodel:gemini-3.7-flash"},
+                        {"text": "🧠 Gemini 3.7 Flash", "callback_data": "setmodel:gemini-3.7-flash"},
                     ],
                     [
-                        {"text": "🧠 Gemini 2.5 Pro (Học thuật, chuyên sâu)", "callback_data": "setmodel:gemini-2.5-pro"},
+                        {"text": "💎 Gemini 1.5 Pro", "callback_data": "setmodel:gemini-1.5-pro"},
+                    ],
+                    [
+                        {"text": "🚀 DeepSeek V4 Pro", "callback_data": "setmodel:deepseek-v4-pro"},
+                    ],
+                    [
+                        {"text": "🐳 DeepSeek V3", "callback_data": "setmodel:deepseek-chat"},
+                        {"text": "🧠 DeepSeek R1", "callback_data": "setmodel:deepseek-reasoner"},
                     ],
                 ]
             }
             curr = self.settings.get("model", "gemini-3.7-flash")
             self.send_message(
                 chat_id,
-                f"🧠 <b>Chọn Mô hình AI (Gemini Engine)</b>\n"
-                f"Model hiện tại: <code>{curr}</code>\n\n"
-                f"• <b>Flash:</b> Tốc độ cao (~3–5 phút), tối ưu chi phí token, lập luận mạch lạc.\n"
-                f"• <b>Pro:</b> Khả năng lý luận triết học, phản biện đa chiều và dịch thuật văn học tinh tế nhất.",
+                f"🧠 <b>Cấu hình Mô hình AI (LLM)</b>\n"
+                f"Mô hình hiện tại: <code>{curr}</code>\n\n"
+                f"Chọn mô hình bạn muốn dùng cho Dịch & Tóm tắt:",
                 reply_to_message_id=msg_id,
                 thread_id=thread_id,
                 reply_markup=keyboard,
             )
             return
+
+
 
         # ── /library hoặc /books ──
         elif cmd in ("/library", "/books"):
@@ -1172,21 +2127,36 @@ class TelegramBookBot:
                 )
                 return
 
-            short_books = [f for f in epubs if "_short" in f.stem]
-            trans_books = [f for f in epubs if ".vi" in f.stem or "_vi" in f.stem or "_short" not in f.stem]
+            short_books = [f for f in epubs if "_short" in f.stem.lower() or "_shortform" in f.stem.lower()]
+            trans_books = [
+                f for f in epubs
+                if any(t in f.stem.lower() for t in (".vi", "_vi", "_vn", ".vn"))
+                or ("_short" not in f.stem.lower() and "_shortform" not in f.stem.lower())
+            ]
 
             lines = ["📚 <b>THƯ VIỆN SÁCH ĐÃ XỬ LÝ</b>\n━━━━━━━━━━━━━━━━━━━━\n"]
             if short_books:
                 lines.append(f"⚡ <b>Bản Tóm Tắt Shortform ({len(short_books)} cuốn):</b>")
                 for i, f in enumerate(short_books[:10], 1):
-                    clean = f.stem.replace("_short", "").replace("_", " ")
+                    clean = (
+                        f.stem.replace("_shortform", "")
+                        .replace("_short", "")
+                        .replace("_", " ")
+                    )
                     lines.append(f"{i}. <b>{clean}</b> ➔ <code>/get {f.stem}</code> (hoặc <code>/quick {f.stem}</code>)")
                 lines.append("")
 
             if trans_books:
                 lines.append(f"📖 <b>Bản Dịch Tiếng Việt ({len(trans_books)} cuốn):</b>")
                 for i, f in enumerate(trans_books[:10], 1):
-                    clean = f.stem.replace(".vi", "").replace("_vi", "").replace("_", " ")
+                    clean = (
+                        f.stem.replace(".vi", "")
+                        .replace("_vi", "")
+                        .replace("_vn", "")
+                        .replace("_VN", "")
+                        .replace(".vn", "")
+                        .replace("_", " ")
+                    )
                     lines.append(f"{i}. <b>{clean}</b> ➔ <code>/get {f.stem}</code>")
                 lines.append("")
 
@@ -1195,11 +2165,17 @@ class TelegramBookBot:
             self.send_message(chat_id, "\n".join(lines), reply_to_message_id=msg_id, thread_id=thread_id)
             return
 
-        # ── /podcast hoặc /audio hoặc /nghe ──
-        elif cmd in ("/podcast", "/audio", "/nghe"):
+        # ── /podcast hoặc /audio hoặc /nghe hoặc /podcast_deep hoặc /deepdive ──
+        elif cmd in ("/podcast", "/audio", "/nghe", "/podcast_quick", "/podcast_deep", "/deepdive"):
             if not self.is_authorized(from_user, chat):
                 self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
                 return
+
+            is_deep = cmd in ("/podcast_deep", "/deepdive")
+            job_type = "podcast_book_deep" if is_deep else "podcast_book_quick"
+            action_code = "pod_deep" if is_deep else "pod_quick"
+            type_title = "🎙️" if is_deep else "🎙️ Tóm tắt"
+            icon = "🧠🎙️" if is_deep else "⚡🎙️"
 
             reply_msg = message.get("reply_to_message", {})
             doc = reply_msg.get("document") if reply_msg else None
@@ -1210,17 +2186,18 @@ class TelegramBookBot:
             if doc and doc.get("file_name", "").lower().endswith((".epub", ".pdf")):
                 raw_file_name = doc["file_name"]
                 file_name = clean_book_filename(raw_file_name)
+                curr_engine = self.settings.get("engine", "zerotts")
                 voice_code = self.settings.get("voice")
-                reader_name = get_reader_name(voice_code)
+                reader_name = get_reader_name(voice_code, engine=curr_engine)
                 self.send_message(
                     chat_id,
-                    f"🎙️ Đã nhận yêu cầu <b>Tạo Audio Podcast (Host: {reader_name})</b> cho sách: <code>{file_name}</code>!\n⏳ Đang đưa vào hàng đợi...",
+                    f"{icon} Đã nhận yêu cầu tạo <b>{type_title} (Host: {reader_name})</b> cho sách: <code>{file_name}</code>!\n⏳ Đang đưa vào hàng đợi...",
                     reply_to_message_id=msg_id,
                     thread_id=thread_id,
                 )
                 self.job_queue.put({
-                    "type": "podcast_book",
-                    "action": "podcast",
+                    "type": job_type,
+                    "action": action_code,
                     "file_id": doc["file_id"],
                     "file_name": file_name,
                     "chat_id": chat_id,
@@ -1229,6 +2206,15 @@ class TelegramBookBot:
                     "sender_name": sender_name,
                 })
                 return
+            else:
+                # 2. Trường hợp Reply vào tin nhắn có liên kết YouTube hoặc bài viết
+                reply_url = self.extract_url_from_message(reply_msg) if reply_msg else None
+                if reply_url:
+                    fake_msg = dict(message)
+                    action_word = "podcast sâu" if is_deep else "podcast"
+                    fake_msg["text"] = f"{arg} {action_word}".strip()
+                    self.handle_incoming_url(fake_msg, reply_url)
+                    return
 
             # 2. Trường hợp gõ lệnh kèm tên sách (ví dụ: /podcast Barking_Up_the_Wrong_Tree)
             if arg:
@@ -1236,22 +2222,23 @@ class TelegramBookBot:
                     f for f in OUTPUT_DIR.glob("*.epub")
                     if arg.lower() in f.stem.lower() and not f.name.startswith(".")
                 ]
-                short_matches = [f for f in matches if "_short" in f.stem]
+                short_matches = [f for f in matches if "_short" in f.stem or "_shortform" in f.stem]
                 target_file = short_matches[0] if short_matches else (matches[0] if matches else None)
 
                 if target_file:
+                    curr_engine = self.settings.get("engine", "zerotts")
                     voice_code = self.settings.get("voice")
-                    reader_name = get_reader_name(voice_code)
+                    reader_name = get_reader_name(voice_code, engine=curr_engine)
                     self.send_message(
                         chat_id,
-                        f"🎙️ Đã tìm thấy sách <b>{target_file.name}</b> trong Thư viện.\n"
-                        f"⏳ Đang đưa vào hàng đợi tạo <b>Audio Podcast (Host: {reader_name})</b>...",
+                        f"{icon} Đã tìm thấy sách <b>{target_file.name}</b> trong Thư viện.\n"
+                        f"⏳ Đang đưa vào hàng đợi tạo <b>{type_title} (Host: {reader_name})</b>...",
                         reply_to_message_id=msg_id,
                         thread_id=thread_id,
                     )
                     self.job_queue.put({
-                        "type": "podcast_book",
-                        "action": "podcast",
+                        "type": job_type,
+                        "action": action_code,
                         "file_id": None,
                         "file_name": target_file.name,
                         "chat_id": chat_id,
@@ -1271,20 +2258,23 @@ class TelegramBookBot:
                     return
 
             # 3. Trường hợp gõ /podcast trống -> Hướng dẫn chi tiết
+            curr_engine = self.settings.get("engine", "zerotts")
             voice_code = self.settings.get("voice")
-            reader_name = get_reader_name(voice_code)
-            podcast_speed = self.settings.get("podcast_speed", 1.1)
+            reader_name = get_reader_name(voice_code, engine=curr_engine)
+            podcast_speed = self.settings.get("podcast_speed", 1.15)
             help_podcast = (
                 "🎙️ <b>TẠO AUDIO PODCAST TÓM TẮT SÁCH (VIENEU AI 48kHz)</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "Bot sử dụng Gemini để chuyển hóa bản tóm tắt sách thành kịch bản đối thoại lôi cuốn, "
-                "sau đó sử dụng công nghệ mô hình âm thanh VieNeu-TTS v3 Turbo (48kHz) để xuất bản file âm thanh MP3 chất lượng phòng thu.\n\n"
-                "🎧 <b>3 Cách tạo Podcast cực nhanh:</b>\n"
-                "1. <b>Reply file sách:</b> Reply vào bất kỳ file sách <code>.epub</code>/<code>.pdf</code> nào và gõ <code>/podcast</code>.\n"
-                "2. <b>Gửi file sách mới:</b> Gửi file vào chat và bấm nút <b>🎙️ Tạo Audio Podcast</b>.\n"
-                "3. <b>Tạo từ Thư viện:</b> Gõ <code>/podcast &lt;tên sách&gt;</code> (ví dụ: <code>/podcast Barking_Up_the_Wrong_Tree</code>).\n\n"
-                f"🗣️ <b>Host hiện tại:</b> <b>{reader_name}</b> (<code>{resolve_voice_code(voice_code)}</code>)\n"
-                f"⚡ <b>Tốc độ đọc:</b> <b>{podcast_speed}x</b> (Gõ <code>/speed</code> để chọn 1.1x / 1.2x / 1.3x)\n"
+                "Bot hỗ trợ <b>2 định dạng Audio chuyên biệt</b> phục vụ các nhu cầu tiếp nhận khác nhau:\n\n"
+                "⚡🎙️ <b>1. Podcast Tinh Gọn (Quick Listen - 8–12 phút):</b>\n"
+                "• Cô đọng luận đề cốt lõi, 2-3 bài học đắt giá nhất và 1 hành vi hành động.\n"
+                "• Dùng lệnh: <code>/podcast &lt;tên sách&gt;</code> (hoặc Reply file và gõ <code>/podcast</code>)\n\n"
+                "🧠🎙️ <b>2. Podcast Chuyên Sâu (Deep Dive - 20–30 phút):</b>\n"
+                "• Masterclass đi sâu vào cơ chế hoạt động, phản biện điểm mù tác giả và ma trận Heuristics.\n"
+                "• Dùng lệnh: <code>/podcast_deep &lt;tên sách&gt;</code> (hoặc Reply file và gõ <code>/podcast_deep</code>)\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🗣️ <b>Host hiện tại:</b> <b>{reader_name}</b> (<code>{resolve_voice_code(voice_code, engine=curr_engine)}</code>)\n"
+                f"⚡ <b>Tốc độ đọc:</b> <b>{podcast_speed}x</b> (Gõ <code>/speed</code> để chọn 1.1x / 1.15x / 1.2x)\n"
                 f"👉 Gõ <code>/voice</code> để chọn Host đọc khác (Minh Quân, Thái Sơn, Anh Khôi, Quỳnh Anh...)!"
             )
             self.send_message(chat_id, help_podcast, reply_to_message_id=msg_id, thread_id=thread_id)
@@ -1296,12 +2286,17 @@ class TelegramBookBot:
                 self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
                 return
 
+            curr_engine = self.settings.get("engine", "zerotts")
             if arg:
-                code = resolve_voice_code(arg)
+                code = resolve_voice_code(arg, engine=curr_engine)
                 if code in POPULAR_VOICES:
                     self.settings["voice"] = code
+                    if code in ZEROTTS_POPULAR_VOICES:
+                        self.settings["engine"] = "zerotts"
+                    elif code in VIENEU_POPULAR_VOICES:
+                        self.settings["engine"] = "vieneu"
                     self._save_settings()
-                    r_name = get_reader_name(code)
+                    r_name = get_reader_name(code, engine=self.settings.get("engine"))
                     self.send_message(
                         chat_id,
                         f"✅ Đã chọn giọng đọc Podcast: <b>{r_name}</b> (<code>{code}</code>)",
@@ -1310,40 +2305,97 @@ class TelegramBookBot:
                     )
                     return
 
-            current_voice = resolve_voice_code(self.settings.get("voice"))
-            current_name = get_reader_name(current_voice)
-            curr_speed = self.settings.get("podcast_speed", 1.1)
+            current_voice = resolve_voice_code(self.settings.get("voice"), engine=curr_engine)
+            current_name = get_reader_name(current_voice, engine=curr_engine)
+            curr_speed = self.settings.get("podcast_speed", 1.15)
 
             keyboard = {
                 "inline_keyboard": [
                     [
-                        {"text": "🎙️ HN - Minh Quân (Host tự nhiên)", "callback_data": "setvoice:Minh Quân"},
-                        {"text": "📖 SG - Thái Sơn (Kể chuyện / Audiobook)", "callback_data": "setvoice:Thái Sơn"},
+                        {"text": f"{'✅ ' if current_voice == 'maichi' else ''}🎙️ Mai Chi (Nữ nhẹ nhàng)", "callback_data": "setvoice:maichi"},
+                        {"text": f"{'✅ ' if current_voice == 'giahuy' else ''}☕ Gia Huy (Nam trầm ấm)", "callback_data": "setvoice:giahuy"},
                     ],
                     [
-                        {"text": "☕ HN - Anh Khôi (Trầm ấm / Sách nói)", "callback_data": "setvoice:Anh Khôi"},
-                        {"text": "🌸 HN - Quỳnh Anh (Đọc truyện diễn cảm)", "callback_data": "setvoice:Quỳnh Anh"},
+                        {"text": f"{'✅ ' if current_voice == 'baotrang' else ''}📰 Bảo Trang (Nữ tin tức)", "callback_data": "setvoice:baotrang"},
+                        {"text": f"{'✅ ' if current_voice == 'kimoanh' else ''}🌸 Kim Oanh (Nữ ấm áp)", "callback_data": "setvoice:kimoanh"},
                     ],
                     [
-                        {"text": "✨ HN - Ngọc Huyền (Podcast tự nhiên)", "callback_data": "setvoice:Ngọc Huyền"},
-                        {"text": "🌴 SG - Thục Đoan (Kể chuyện miền Nam)", "callback_data": "setvoice:Thục Đoan"},
+                        {"text": f"{'✅ ' if current_voice == 'quangminh' else ''}⚡ Quang Minh (Nam dứt khoát)", "callback_data": "setvoice:quangminh"},
+                        {"text": f"{'✅ ' if current_voice == 'huuduc' else ''}📖 Hữu Đức (Nam điềm đạm)", "callback_data": "setvoice:huuduc"},
                     ],
                     [
-                        {"text": "🏔️ Huế - Quang Sơn (Miền Trung tự nhiên)", "callback_data": "setvoice:Quang Sơn"},
-                        {"text": "🌿 HN - Trúc Ly (Trong trẻo nhẹ nhàng)", "callback_data": "setvoice:Trúc Ly"},
+                        {"text": f"{'✅ ' if current_voice == 'Minh Quân' else ''}🦜 VieNeu - Minh Quân", "callback_data": "setvoice:Minh Quân"},
+                        {"text": f"{'✅ ' if current_voice == 'Thái Sơn' else ''}🦜 VieNeu - Thái Sơn", "callback_data": "setvoice:Thái Sơn"},
+                    ],
+                    [
+                        {"text": "⚙️ Chọn TTS Engine (/engine)", "callback_data": "cmd_engine"},
                     ],
                 ]
             }
 
+            eng_title = "ZeroTTS 48kHz (Real-Time CPU)" if curr_engine == "zerotts" else ("VieNeu-TTS 48kHz" if curr_engine == "vieneu" else "Vbee Cloud")
             voice_msg = (
-                "🗣️ <b>CÀI ĐẶT GIỌNG ĐỌC PODCAST (VIENEU AI v3 TURBO)</b>\n"
+                "🗣️ <b>CÀI ĐẶT GIỌNG ĐỌC PODCAST (ZEROTTS & VIENEU)</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Giọng đọc hiện tại: <b>{current_name}</b> (<code>{current_voice}</code>)\n"
-                f"Tốc độ đọc hiện tại: <b>{curr_speed}x</b> (Gõ <code>/speed</code> để đổi tốc độ)\n"
-                f"Công nghệ: <b>VieNeu-TTS 48kHz</b> (Chuẩn âm thanh phòng thu, đọc song ngữ mượt mà)\n\n"
+                f"Công nghệ TTS: <b>{eng_title}</b>\n"
+                f"Tốc độ đọc: <b>{curr_speed}x</b> (Gõ <code>/speed</code> để đổi tốc độ)\n\n"
                 "Bấm chọn giọng Host bạn muốn người dẫn chuyện cho các tập Audio Podcast:"
             )
             self.send_message(chat_id, voice_msg, reply_to_message_id=msg_id, thread_id=thread_id, reply_markup=keyboard)
+            return
+
+        # ── /engine hoặc /tts ──
+        elif cmd in ("/engine", "/tts"):
+            if not self.is_authorized(from_user, chat):
+                self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+                return
+
+            if arg:
+                clean_eng = arg.lower().strip()
+                if clean_eng in ("zerotts", "vieneu", "vbee"):
+                    self.settings["engine"] = clean_eng
+                    if clean_eng == "zerotts":
+                        self.settings["voice"] = "maichi"
+                    elif clean_eng == "vieneu":
+                        self.settings["voice"] = "Minh Quân"
+                    else:
+                        self.settings["voice"] = "hn_female_maiphuong_vdts_48k-fhg"
+                    self._save_settings()
+                    r_name = get_reader_name(self.settings["voice"], engine=clean_eng)
+                    self.send_message(
+                        chat_id,
+                        f"✅ Đã đổi TTS Engine sang: <b>{clean_eng.upper()}</b> (Host: {r_name})",
+                        reply_to_message_id=msg_id,
+                        thread_id=thread_id,
+                    )
+                    return
+
+            curr_engine = self.settings.get("engine", "zerotts")
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": f"{'✅ ' if curr_engine == 'zerotts' else ''}⚡ ZeroTTS (48kHz CPU, Real-Time)", "callback_data": "setengine:zerotts"},
+                    ],
+                    [
+                        {"text": f"{'✅ ' if curr_engine == 'vieneu' else ''}🦜 VieNeu-TTS (48kHz On-device)", "callback_data": "setengine:vieneu"},
+                    ],
+                    [
+                        {"text": f"{'✅ ' if curr_engine == 'vbee' else ''}☁️ Vbee AIVoice (Cloud API)", "callback_data": "setengine:vbee"},
+                    ],
+                ]
+            }
+            curr_title = "ZeroTTS 48kHz (Khuyên dùng)" if curr_engine == "zerotts" else ("VieNeu-TTS 48kHz" if curr_engine == "vieneu" else "Vbee Cloud")
+            engine_msg = (
+                "⚙️ <b>CÀI ĐẶT CÔNG NGHỆ GIỌNG ĐỌC AI (TTS ENGINE)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Engine hiện tại: <b>{curr_title}</b>\n\n"
+                "• <b>ZeroTTS</b>: Chạy real-time trên CPU laptop, WER chỉ 1.03%, âm thanh chuẩn 48kHz, đọc song ngữ Anh-Việt liền mạch.\n"
+                "• <b>VieNeu-TTS</b>: Chạy on-device 48kHz, hỗ trợ Voice Cloning tức thì từ file mẫu.\n"
+                "• <b>Vbee AIVoice</b>: Cloud API thương mại.\n\n"
+                "<i>Bấm chọn công nghệ bên dưới hoặc gõ ví dụ: <code>/engine zerotts</code></i>"
+            )
+            self.send_message(chat_id, engine_msg, reply_to_message_id=msg_id, thread_id=thread_id, reply_markup=keyboard)
             return
 
         # ── /speed hoặc /tocdo ──
@@ -1355,8 +2407,8 @@ class TelegramBookBot:
             if arg:
                 clean_arg = arg.lower().replace("x", "").strip()
                 try:
-                    val = round(float(clean_arg), 1)
-                    if val in (1.1, 1.2, 1.3):
+                    val = round(float(clean_arg), 2)
+                    if val in (1.1, 1.15, 1.2):
                         self.settings["podcast_speed"] = val
                         self._save_settings()
                         self.send_message(
@@ -1370,7 +2422,7 @@ class TelegramBookBot:
                     else:
                         self.send_message(
                             chat_id,
-                            f"⚠️ Tốc độ không hợp lệ. Vui lòng chọn một trong các mức: <b>1.1x</b>, <b>1.2x</b>, <b>1.3x</b> (ví dụ: <code>/speed 1.2</code>).",
+                            f"⚠️ Tốc độ không hợp lệ. Vui lòng chọn một trong các mức: <b>1.1x</b>, <b>1.15x</b>, <b>1.2x</b> (ví dụ: <code>/speed 1.15</code>).",
                             reply_to_message_id=msg_id,
                             thread_id=thread_id,
                         )
@@ -1378,21 +2430,21 @@ class TelegramBookBot:
                 except ValueError:
                     pass
 
-            curr_speed = float(self.settings.get("podcast_speed", 1.1))
+            curr_speed = float(self.settings.get("podcast_speed", 1.15))
             keyboard = {
                 "inline_keyboard": [
                     [
                         {
-                            "text": f"{'✅ ' if curr_speed == 1.1 else ''}⚡ 1.1x (Mặc định)",
+                            "text": f"{'✅ ' if curr_speed == 1.1 else ''}⚡ 1.1x (Thong thả)",
                             "callback_data": "setspeed:1.1",
+                        },
+                        {
+                            "text": f"{'✅ ' if curr_speed == 1.15 else ''}✨ 1.15x (Mặc định)",
+                            "callback_data": "setspeed:1.15",
                         },
                         {
                             "text": f"{'✅ ' if curr_speed == 1.2 else ''}🚀 1.2x (Hơi nhanh)",
                             "callback_data": "setspeed:1.2",
-                        },
-                        {
-                            "text": f"{'✅ ' if curr_speed == 1.3 else ''}🔥 1.3x (Nhanh)",
-                            "callback_data": "setspeed:1.3",
                         },
                     ]
                 ]
@@ -1403,10 +2455,10 @@ class TelegramBookBot:
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Tốc độ hiện tại: <b>{curr_speed}x</b>\n\n"
                 "Chọn tốc độ đọc phù hợp với phong cách nghe của bạn:\n"
-                "• <b>1.1x</b> (Mặc định): Tốc độ tự nhiên, rõ ràng, không lê thê.\n"
-                "• <b>1.2x</b>: Hơi nhanh, tiết kiệm thời gian, dễ tập trung nắm bắt ý chính.\n"
-                "• <b>1.3x</b>: Nhanh, phong cách speed-listening cho bạn đọc bận rộn.\n\n"
-                "<i>Bấm nút bên dưới để chọn ngay hoặc gõ ví dụ: <code>/speed 1.2</code></i>"
+                "• <b>1.1x</b>: Thong thả, tự nhiên, rõ ràng từng chi tiết.\n"
+                "• <b>1.15x</b> (Mặc định): Tối ưu, liền mạch và giữ trọn ngữ điệu tự nhiên nhất.\n"
+                "• <b>1.2x</b>: Hơi nhanh, tiết kiệm thời gian, dễ tập trung nắm bắt ý chính.\n\n"
+                "<i>Bấm nút bên dưới để chọn ngay hoặc gõ ví dụ: <code>/speed 1.15</code></i>"
             )
             self.send_message(
                 chat_id,
@@ -1727,6 +2779,177 @@ class TelegramBookBot:
                 return c_file
         return None
 
+    def run_command_with_progress(
+        self,
+        cmd: list[str],
+        env: dict[str, str],
+        task_label: str,
+        file_name: str,
+        active_model: str,
+        chat_id: int | str,
+        status_msg_id: int | None,
+        start_time: float,
+    ) -> ProcessResult:
+        """Thực thi tiến trình CLI và cập nhật thanh trạng thái Telegram [██████░░░░] realtime."""
+        sub_env = dict(env)
+        sub_env["PYTHONUNBUFFERED"] = "1"
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                cwd=str(PROJECT_DIR),
+                env=sub_env,
+            )
+        except Exception as e:
+            print(f"[Worker] Không thể khởi chạy tiến trình: {e}", file=sys.stderr)
+            return ProcessResult(returncode=-1, stdout="", stderr=str(e))
+
+        stdout_lines: list[str] = []
+        last_edit_time = 0.0
+        last_edit_text = ""
+        current_step = 0
+        total_steps = 0
+        current_detail = "Đang đọc và phân tích cấu trúc tài liệu..."
+        is_summarize = "tóm tắt" in task_label.lower()
+        icon = "⚙️" if is_summarize else "📖"
+
+        re_plan_total = re.compile(r"Kế hoạch:\s*(\d+)\s*bài học", re.IGNORECASE)
+        re_lesson_prog = re.compile(r"Bài\s+(\d+)/(\d+)(?:\s*\((.*?)\))?", re.IGNORECASE)
+        re_chap_prog = re.compile(r"Chương\s+(\d+)/(\d+)(?:\s*—\s*chunk\s+(\d+)/(\d+))?", re.IGNORECASE)
+        re_ocr_prog = re.compile(r"OCR trang\s+(\d+)\s*\((\d+)/(\d+)\)", re.IGNORECASE)
+
+        def update_telegram_status(force: bool = False) -> None:
+            nonlocal last_edit_time, last_edit_text
+            if not status_msg_id:
+                return
+            now = time.time()
+            if not force and (now - last_edit_time) < 3.5:
+                return
+
+            elapsed_sec = int(now - start_time)
+            elapsed_m, elapsed_s = elapsed_sec // 60, elapsed_sec % 60
+            time_str = f"{elapsed_m}m{elapsed_s}s" if elapsed_m < 60 else f"{elapsed_m // 60}h{elapsed_m % 60:02d}m"
+
+            if total_steps > 0:
+                bar_str = render_progress_bar(current_step, total_steps)
+                if is_summarize:
+                    step_info = f" (Bài {current_step}/{total_steps})" if current_step > 0 else f" (Tổng {total_steps} bài)"
+                else:
+                    step_info = f" (Chương {current_step}/{total_steps})" if current_step > 0 else f" (Tổng {total_steps} chương)"
+                prog_label = f"<code>{bar_str}</code>{step_info}"
+
+                if current_step > 0 and current_step < total_steps:
+                    sec_per_step = elapsed_sec / current_step
+                    rem_sec = int(sec_per_step * (total_steps - current_step))
+                    rem_m = rem_sec // 60
+                    rem_str = f"~{rem_m}m" if rem_m < 60 else f"~{rem_m // 60}h{rem_m % 60:02d}m"
+                    time_info = f"Đã chạy {time_str} | Dự kiến còn {rem_str}"
+                else:
+                    time_info = f"Đã chạy {time_str}"
+            else:
+                bar_str = render_progress_bar(0, 10)
+                prog_label = f"<code>{bar_str}</code>"
+                time_info = f"Đã chạy {time_str}"
+
+            text = (
+                f"{icon} <b>Đang {task_label}:</b> <code>{file_name}</code>\n"
+                f"🧠 <b>Model:</b> <code>{active_model}</code>\n"
+                f"📊 <b>Tiến độ:</b> {prog_label}\n"
+                f"📍 <b>Chi tiết:</b> <i>{current_detail}</i>\n"
+                f"⏱️ <b>Thời gian:</b> {time_info}"
+            )
+
+            if text == last_edit_text:
+                return
+
+            res = self.edit_message_text(chat_id, status_msg_id, text)
+            if res and res.get("ok"):
+                last_edit_time = now
+                last_edit_text = text
+
+        try:
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, ""):
+                    stdout_lines.append(line)
+                    line_clean = line.strip()
+                    if not line_clean:
+                        continue
+
+                    # Bắt kế hoạch tổng số bài (Summarize)
+                    if m_plan := re_plan_total.search(line_clean):
+                        total_steps = int(m_plan.group(1))
+                        current_detail = f"Kế hoạch gồm {total_steps} bài học Shortform."
+                        update_telegram_status()
+                        continue
+
+                    # Bắt tiến trình từng bài (Summarize)
+                    if m_lesson := re_lesson_prog.search(line_clean):
+                        current_step = int(m_lesson.group(1))
+                        total_steps = int(m_lesson.group(2))
+                        scope = m_lesson.group(3) or ""
+                        current_detail = f"Đang phân tích và sinh Bài {current_step}/{total_steps}"
+                        if scope:
+                            current_detail += f" ({scope})"
+                        current_detail += "..."
+                        update_telegram_status()
+                        continue
+
+                    # Bắt tiến trình từng chương (Translate)
+                    if m_chap := re_chap_prog.search(line_clean):
+                        current_step = int(m_chap.group(1))
+                        total_steps = int(m_chap.group(2))
+                        chunk_cur = m_chap.group(3)
+                        chunk_tot = m_chap.group(4)
+                        if chunk_cur and chunk_tot:
+                            current_detail = f"Đang dịch Chương {current_step}/{total_steps} (phần {chunk_cur}/{chunk_tot})..."
+                        else:
+                            current_detail = f"Đang dịch Chương {current_step}/{total_steps}..."
+                        update_telegram_status()
+                        continue
+
+                    # Bắt OCR
+                    if m_ocr := re_ocr_prog.search(line_clean):
+                        current_detail = f"Đang OCR trang {m_ocr.group(1)} ({m_ocr.group(2)}/{m_ocr.group(3)})..."
+                        update_telegram_status()
+                        continue
+
+                    # Các mốc sự kiện quan trọng
+                    if "Đang phân tích sách" in line_clean:
+                        current_detail = "Đang phân tích bối cảnh & phân loại chương..."
+                        update_telegram_status()
+                    elif "Đang viết bài mở đầu" in line_clean:
+                        current_detail = "Đang tổng hợp bài mở đầu (Overview)..."
+                        update_telegram_status()
+                    elif "Đang viết bài tổng kết" in line_clean:
+                        current_detail = "Đang tổng hợp bài kết luận (Recap)..."
+                        update_telegram_status()
+                    elif "Hoàn tất:" in line_clean or "Ghi EPUB" in line_clean:
+                        current_detail = "Đang hoàn tất đóng gói file EPUB..."
+                        if total_steps > 0:
+                            current_step = total_steps
+                        update_telegram_status()
+
+            proc.wait()
+        except Exception as e:
+            print(f"[Worker] Ngoại lệ khi theo dõi tiến độ: {e}", file=sys.stderr)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+        if proc.returncode == 0 and status_msg_id:
+            if total_steps > 0:
+                current_step = total_steps
+            current_detail = "Đã xử lý hoàn tất! Đang đóng gói và gửi file..."
+            update_telegram_status(force=True)
+
+        full_stdout = "".join(stdout_lines)
+        return ProcessResult(returncode=proc.returncode or 0, stdout=full_stdout, stderr="")
+
     # ── 7. Worker Loop xử lý hàng đợi ngầm ──
     def worker_loop(self) -> None:
         while self.running:
@@ -1748,6 +2971,12 @@ class TelegramBookBot:
         thread_id = job.get("thread_id")
         msg_id = job.get("msg_id")
         sender_name = job.get("sender_name", "Bạn đọc")
+
+        # ── TRƯỜNG HỢP D: XỬ LÝ BÀI VIẾT TỪ LIÊN KẾT (URL) ──
+        if job_type.startswith("article_"):
+            self.process_article_job(job)
+            return
+
         file_id = job.get("file_id")
         file_name = clean_book_filename(job.get("file_name", "book.epub"))
 
@@ -1758,11 +2987,24 @@ class TelegramBookBot:
             and str(thread_id or "") == str(target_group_topic)
         )
 
-        # 1. Tải file về máy nếu có file_id
+        # 1. Xác định file đầu vào (ưu tiên kiểm tra file đã có trên máy để tránh lỗi getFile hết hạn)
         target_path = INBOX_DIR / file_name
-        if file_id:
-            if not self.download_file(file_id, target_path):
-                self.send_message(chat_id, f"❌ Tải file <b>{file_name}</b> thất bại. Vui lòng thử lại!", reply_to_message_id=msg_id, thread_id=thread_id)
+        if not target_path.exists():
+            if (ORIGINALS_DIR / file_name).exists():
+                target_path = ORIGINALS_DIR / file_name
+            elif (PROCESSING_DIR / file_name).exists():
+                target_path = PROCESSING_DIR / file_name
+            elif file_id:
+                if not self.download_file(file_id, target_path):
+                    self.send_message(chat_id, f"❌ Tải file <b>{file_name}</b> thất bại. Vui lòng thử lại!", reply_to_message_id=msg_id, thread_id=thread_id)
+                    return
+            else:
+                self.send_message(
+                    chat_id,
+                    f"❌ Không tìm thấy file <b>{file_name}</b> trên máy tính để xử lý. Vui lòng gửi lại file!",
+                    reply_to_message_id=msg_id,
+                    thread_id=thread_id,
+                )
                 return
 
         stem = Path(file_name).stem
@@ -1770,14 +3012,16 @@ class TelegramBookBot:
 
         # ── TRƯỜNG HỢP A: TÓM TẮT SHORTFORM (HOẶC CẢ TÓM TẮT & LÀM PODCAST) ──
         if job_type in ("summarize_book", "sum_and_pod", "both"):
-            self.send_message(
+            status_msg = self.send_message(
                 chat_id,
                 f"⚙️ <b>Bắt đầu tóm tắt Shortform:</b> <code>{file_name}</code>\n"
-                f"🧠 Gemini (<code>{active_model}</code>) đang phân tích cấu trúc, trích xuất luận đề & biên soạn các bài học chuyên sâu...\n"
-                f"<i>(Thời gian xử lý: khoảng 3 – 8 phút)</i>",
+                f"🧠 <b>Model:</b> <code>{active_model}</code>\n"
+                f"📊 <b>Tiến độ:</b> <code>[░░░░░░░░░░] 0%</code>\n"
+                f"📍 <i>Đang đọc và phân tích cấu trúc tài liệu...</i>",
                 reply_to_message_id=msg_id,
                 thread_id=thread_id,
             )
+            status_msg_id = status_msg.get("result", {}).get("message_id") if status_msg else None
 
             start_time = time.time()
             output_epub = OUTPUT_DIR / f"{stem}_short.epub"
@@ -1797,7 +3041,16 @@ class TelegramBookBot:
 
             sub_env = dict(os.environ)
             sub_env.update(load_env(ENV_PATH))
-            res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_DIR), env=sub_env)
+            res = self.run_command_with_progress(
+                cmd=cmd,
+                env=sub_env,
+                task_label="tóm tắt Shortform",
+                file_name=file_name,
+                active_model=active_model,
+                chat_id=chat_id,
+                status_msg_id=status_msg_id,
+                start_time=start_time,
+            )
             dur = int(time.time() - start_time)
             dur_m, dur_s = dur // 60, dur % 60
 
@@ -1821,6 +3074,7 @@ class TelegramBookBot:
                         self.send_message(chat_id, brief_text, reply_to_message_id=msg_id, thread_id=thread_id)
 
                 # Gửi file EPUB
+                book_tags_str = format_tags(generate_topic_tags(stem, getattr(analysis, "book_context", ""), output_type="short"))
                 caption = (
                     f"⚡ <b>{stem}</b>\n"
                     f"✨ <i>Bản tóm tắt chuyên sâu phong cách Shortform</i>\n\n"
@@ -1828,44 +3082,150 @@ class TelegramBookBot:
                     f"📱 <i>Đã đóng gói chuẩn EPUB3, tương thích Apple Books, Kindle, Kobo!</i>\n"
                     f"💡 <i>Gõ /podcast để nghe tập tóm tắt này dưới dạng Audio!</i>"
                 )
+                if book_tags_str:
+                    caption += f"\n\n{book_tags_str}"
                 self.send_document(chat_id, output_epub, caption=caption, reply_to_message_id=msg_id, thread_id=thread_id)
 
                 if not is_already_in_group:
                     group_caption = (
                         f"⚡ <b>{stem}</b>\n"
                         f"✨ <i>Bản tóm tắt chuyên sâu phong cách Shortform</i>\n\n"
-                        f"👤 <b>Yêu cầu bởi:</b> {sender_name}\n"
                         f"⏱️ <b>Thời gian xử lý:</b> {dur_m}m{dur_s}s\n"
                         f"📱 <i>Đã đóng gói chuẩn EPUB3!</i>"
                     )
+                    if book_tags_str:
+                        group_caption += f"\n\n{book_tags_str}"
                     self.send_document(target_group_chat, output_epub, caption=group_caption, thread_id=target_group_topic)
 
-                # Nếu người dùng chọn Tóm tắt & Làm Podcast (sum_and_pod)
-                if job_type == "sum_and_pod":
-                    self.send_message(chat_id, "🎙️ Đang tiếp tục biên soạn kịch bản và tạo <b>Audio Podcast</b>...", thread_id=thread_id)
+                # Nếu người dùng chọn Tóm tắt & Làm Podcast (sum_and_pod, sum_and_pod_quick, sum_and_pod_deep)
+                if job_type in ("sum_and_pod", "sum_and_pod_quick", "sum_and_pod_deep"):
+                    is_deep = (job_type == "sum_and_pod_deep")
+                    mode = "deep" if is_deep else "quick"
+                    type_title = "Podcast Chuyên Sâu" if is_deep else "Podcast Tinh Gọn"
+                    icon = "🧠🎙️" if is_deep else "⚡🎙️"
+                    est_desc = "20–30 phút • Masterclass" if is_deep else "8–12 phút • Tinh cất"
+
+                    engine_code = self.settings.get("engine", "zerotts")
                     voice_code = self.settings.get("voice")
-                    target_voice = resolve_voice_code(voice_code)
-                    reader_name = get_reader_name(target_voice)
-                    podcast_speed = float(self.settings.get("podcast_speed", 1.1))
-                    mp3_path = create_podcast_for_book(output_epub, voice=target_voice, speed=podcast_speed, send_telegram=False)
+                    target_voice = resolve_voice_code(voice_code, engine=engine_code)
+                    reader_name = get_reader_name(target_voice, engine=engine_code)
+                    podcast_speed = float(self.settings.get("podcast_speed", 1.15))
+
+                    pod_msg = self.send_message(
+                        chat_id,
+                        f"{icon} <b>Bắt đầu tạo {type_title}:</b> <code>{stem}</code>\n"
+                        f"🗣️ <b>Giọng đọc:</b> {reader_name}\n"
+                        f"📊 <b>Tiến độ:</b> <code>{render_progress_bar(1, 3)}</code>\n"
+                        f"📍 <i>Đang biên soạn kịch bản {type_title} ({est_desc})...</i>",
+                        thread_id=thread_id,
+                    )
+                    pod_msg_id = pod_msg.get("result", {}).get("message_id") if pod_msg else None
+
+                    mp3_path = create_podcast_for_book(
+                        output_epub,
+                        voice=target_voice,
+                        engine=engine_code,
+                        speed=podcast_speed,
+                        send_telegram=False,
+                        mode=mode,
+                    )
+
+                    if pod_msg_id:
+                        self.edit_message_text(
+                            chat_id,
+                            pod_msg_id,
+                            f"{icon} <b>Đã tạo {type_title}:</b> <code>{stem}</code>\n"
+                            f"🗣️ <b>Giọng đọc:</b> {reader_name}\n"
+                            f"📊 <b>Tiến độ:</b> <code>{render_progress_bar(3, 3)}</code>\n"
+                            f"📍 <i>Đã tạo thành công! Đang gửi file âm thanh...</i>",
+                        )
+
                     if mp3_path and mp3_path.exists():
-                        p_cap = f"🎙️ <b>Podcast Tóm Tắt: {stem}</b>\n🗣️ <b>Giọng đọc:</b> {reader_name} (AI VieNeu 48kHz • {podcast_speed}x)\n🎧 <i>Thưởng thức ngay trên Telegram!</i>"
-                        self.send_audio(chat_id, mp3_path, caption=p_cap, title=f"Podcast: {stem}", performer=f"{reader_name} ({podcast_speed}x)", thread_id=thread_id)
+                        sub_desc = (
+                            "Bản Nghe Masterclass (20–30 phút) — Phân tích chi tiết cơ chế, phản biện đa chiều và ma trận hành động"
+                            if is_deep
+                            else "Bản Nghe Tinh Cất (8–12 phút) — Nắm bắt nhanh luận đề và 2–3 bài học cốt lõi"
+                        )
+                        clean_stem = (
+                            stem.replace("_shortform", "")
+                            .replace("_short", "")
+                            .replace("_vn", "")
+                            .replace("_VN", "")
+                            .replace(".vi", "")
+                            .replace("_vi", "")
+                        )
+                        clean_title = clean_stem.replace("_", " ").strip()
+                        engine_tag = "ZeroTTS" if engine_code == "zerotts" else ("VieNeu" if engine_code == "vieneu" else "Vbee")
+                        is_long = (mp3_path.stat().st_size > 3 * 1024 * 1024) or is_deep
+                        type_tag = "#podcast" if is_long else "#audio"
+                        raw_tags = generate_topic_tags(clean_stem, output_type="")
+                        kw_cands = [t for t in raw_tags if t.lower() not in ("#podcast", "#audio", "#short", "#dich", "#article", "#shortform", "#kienthuc")]
+                        chosen_kw = kw_cands[0] if kw_cands else "#kienthuc"
+                        if not chosen_kw.startswith("#"):
+                            chosen_kw = f"#{chosen_kw}"
+                        desc_line = f"📝 {type_tag} {chosen_kw}"
+
+                        p_cap = (
+                            f"{icon} <b>{clean_title}</b>\n"
+                            f"🎧 {reader_name} ({engine_tag}, {podcast_speed}x)\n"
+                            f"{desc_line}\n"
+                            f"🚗 <i>Đã đồng bộ vào Apple Podcasts (CarPlay)</i>"
+                        )
+                        self.send_audio(
+                            chat_id,
+                            mp3_path,
+                            caption=p_cap,
+                            title=clean_title,
+                            performer=f"{reader_name} • {'Chuyên Sâu' if is_deep else 'Tinh Gọn'} ({podcast_speed}x)",
+                            thread_id=thread_id,
+                        )
                         if not is_already_in_group:
-                            self.send_audio(target_group_chat, mp3_path, caption=p_cap, title=f"Podcast: {stem}", performer=f"{reader_name} ({podcast_speed}x)", thread_id=target_group_topic)
+                            self.send_audio(
+                                target_group_chat,
+                                mp3_path,
+                                caption=p_cap,
+                                title=clean_title,
+                                performer=f"{reader_name} • {'Chuyên Sâu' if is_deep else 'Tinh Gọn'} ({podcast_speed}x)",
+                                thread_id=target_group_topic,
+                            )
 
                 shutil.rmtree(workdir, ignore_errors=True)
             else:
                 print(f"[Worker] Lỗi tóm tắt {file_name}:\n{res.stderr}\n{res.stdout}", file=sys.stderr)
+                err_token = uuid.uuid4().hex[:8]
+                job_to_save = job.copy()
+                job_to_save["timestamp"] = time.time()
+                self.pending_files[err_token] = job_to_save
+                self._save_pending_files()
+                
+                log_file = LOGS_DIR / f"error_{err_token}.log"
+                log_file.write_text(f"--- STDOUT & STDERR cho {file_name} ---\n{res.stdout}\n{res.stderr}", encoding="utf-8")
+                
+                action_map_rev = {
+                    "summarize_book": "sum",
+                    "sum_and_pod": "sum_pod",
+                    "sum_and_pod_quick": "sum_pod",
+                    "sum_and_pod_deep": "sum_deep_pod",
+                    "both": "both",
+                }
+                action_code = job.get("action") or action_map_rev.get(job_type, "sum")
+                
+                keyboard = {"inline_keyboard": [
+                    [
+                        {"text": "🔄 Thử lại", "callback_data": f"{action_code}:{err_token}"},
+                        {"text": "📋 Xem log", "callback_data": f"errlog:{err_token}"}
+                    ]
+                ]}
+
                 self.send_message(
                     chat_id,
                     f"❌ Có lỗi xảy ra khi tóm tắt <b>{file_name}</b>.\n"
-                    f"Vui lòng kiểm tra log trên máy tính hoặc thử lại.",
+                    f"Vui lòng kiểm tra log hoặc thử lại.",
                     reply_to_message_id=msg_id,
                     thread_id=thread_id,
+                    reply_markup=keyboard,
                 )
-                if job_type == "both":
-                    return
+                return
 
         # ── TRƯỜNG HỢP B: DỊCH TOÀN BỘ SÁCH HOẶC ĐỌC THỬ CHƯƠNG ĐẦU ──
         if job_type in ("translate_book", "preview_book", "both"):
@@ -1877,14 +3237,16 @@ class TelegramBookBot:
             status_desc = "dịch thử 1 chương đầu" if is_preview else "dịch toàn bộ cuốn sách"
             est_time = "~1 – 2 phút" if is_preview else "~15 – 25 phút"
 
-            self.send_message(
+            status_msg = self.send_message(
                 chat_id,
                 f"📖 <b>Bắt đầu {status_desc}:</b> <code>{file_name}</code>\n"
-                f"🧠 Gemini (<code>{active_model}</code>) đang trích xuất bảng thuật ngữ Glossary & tiến hành dịch...\n"
-                f"<i>(Thời gian xử lý: {est_time})</i>",
+                f"🧠 <b>Model:</b> <code>{active_model}</code>\n"
+                f"📊 <b>Tiến độ:</b> <code>[░░░░░░░░░░] 0%</code>\n"
+                f"📍 <i>Đang trích xuất thuật ngữ Glossary và chuẩn bị dịch...</i>",
                 reply_to_message_id=msg_id,
                 thread_id=thread_id,
             )
+            status_msg_id = status_msg.get("result", {}).get("message_id") if status_msg else None
 
             start_time = time.time()
             cmd = [
@@ -1902,7 +3264,16 @@ class TelegramBookBot:
 
             sub_env = dict(os.environ)
             sub_env.update(load_env(ENV_PATH))
-            res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_DIR), env=sub_env)
+            res = self.run_command_with_progress(
+                cmd=cmd,
+                env=sub_env,
+                task_label=status_desc,
+                file_name=file_name,
+                active_model=active_model,
+                chat_id=chat_id,
+                status_msg_id=status_msg_id,
+                start_time=start_time,
+            )
             dur = int(time.time() - start_time)
             dur_m, dur_s = dur // 60, dur % 60
 
@@ -1924,6 +3295,7 @@ class TelegramBookBot:
                 term_note = f"\n📚 <b>Thuật ngữ chuẩn hóa:</b> {term_count} từ" if term_count > 0 else ""
                 preview_note = "\n💡 <i>Gõ /translate để dịch trọn vẹn cả cuốn sách!</i>" if is_preview else ""
 
+                trans_tags_str = format_tags(generate_topic_tags(stem, output_type="dich"))
                 caption = (
                     f"📖 <b>{stem}</b>\n"
                     f"✨ <i>{'Bản dịch thử chương 1' if is_preview else 'Bản dịch tiếng Việt toàn văn chất lượng cao'}</i>\n"
@@ -1931,6 +3303,8 @@ class TelegramBookBot:
                     f"⏱️ <b>Thời gian xử lý:</b> {dur_m}m{dur_s}s\n"
                     f"📱 <i>Đã đóng gói chuẩn EPUB3!</i>{preview_note}"
                 )
+                if trans_tags_str:
+                    caption += f"\n\n{trans_tags_str}"
 
                 self.send_document(chat_id, output_epub, caption=caption, reply_to_message_id=msg_id, thread_id=thread_id)
 
@@ -1938,95 +3312,208 @@ class TelegramBookBot:
                     group_caption = (
                         f"📖 <b>{stem}</b>\n"
                         f"✨ <i>Bản dịch tiếng Việt toàn văn chất lượng cao</i>\n"
-                        f"👤 <b>Yêu cầu bởi:</b> {sender_name}\n"
                         f"⏱️ <b>Thời gian xử lý:</b> {dur_m}m{dur_s}s\n"
                         f"📱 <i>Đã đóng gói chuẩn EPUB3!</i>"
                     )
+                    if trans_tags_str:
+                        group_caption += f"\n\n{trans_tags_str}"
                     self.send_document(target_group_chat, output_epub, caption=group_caption, thread_id=target_group_topic)
 
                 shutil.rmtree(workdir, ignore_errors=True)
             else:
                 print(f"[Worker] Lỗi dịch {file_name}:\n{res.stderr}\n{res.stdout}", file=sys.stderr)
+                err_token = uuid.uuid4().hex[:8]
+                job_to_save = job.copy()
+                job_to_save["timestamp"] = time.time()
+                self.pending_files[err_token] = job_to_save
+                self._save_pending_files()
+                
+                log_file = LOGS_DIR / f"error_{err_token}.log"
+                log_file.write_text(f"--- STDOUT & STDERR cho {file_name} ---\n{res.stdout}\n{res.stderr}", encoding="utf-8")
+                
+                action_map_rev = {"translate_book": "trans", "preview_book": "prev", "both": "both"}
+                action_code = job.get("action") or action_map_rev.get(job_type, "trans")
+                
+                keyboard = {"inline_keyboard": [
+                    [
+                        {"text": "🔄 Thử lại", "callback_data": f"{action_code}:{err_token}"},
+                        {"text": "📋 Xem log", "callback_data": f"errlog:{err_token}"}
+                    ]
+                ]}
+
                 self.send_message(
                     chat_id,
                     f"❌ Quá trình dịch <b>{file_name}</b> gặp lỗi.\n"
-                    f"Vui lòng kiểm tra log trên máy Mac để biết chi tiết.",
+                    f"Vui lòng kiểm tra log hoặc thử lại.",
                     reply_to_message_id=msg_id,
                     thread_id=thread_id,
+                    reply_markup=keyboard,
                 )
+                return
 
-        # ── TRƯỜNG HỢP C: TẠO AUDIO PODCAST (VIENEU TTS) ──
-        if job_type == "podcast_book":
+        # ── TRƯỜNG HỢP C: TẠO AUDIO PODCAST / ĐỌC TOÀN VĂN (VIENEU TTS) ──
+        if job_type in ("podcast_book", "podcast_book_quick", "podcast_book_deep", "podcast_book_direct"):
+            start_time = time.time()
+            is_direct = (job_type == "podcast_book_direct")
+            is_deep = (job_type == "podcast_book_deep")
+            mode = "direct" if is_direct else ("deep" if is_deep else "quick")
+            if is_direct:
+                type_title = "Bản Đọc Nguyên Văn"
+                icon = "🎙️"
+                est_desc = "Đọc trọn vẹn 100% từng câu chữ • Chuẩn phòng thu 48kHz"
+            elif is_deep:
+                type_title = "Podcast Chuyên Sâu"
+                icon = "🧠🎙️"
+                est_desc = "20–30 phút • Mổ xẻ luận điểm & phản biện"
+            else:
+                type_title = "Podcast Tinh Gọn"
+                icon = "⚡🎙️"
+                est_desc = "8–12 phút • Đúc kết ý tưởng cốt lõi"
+
+            engine_code = self.settings.get("engine", "zerotts")
             voice_code = self.settings.get("voice")
-            target_voice = resolve_voice_code(voice_code)
-            reader_name = get_reader_name(target_voice)
+            target_voice = resolve_voice_code(voice_code, engine=engine_code)
+            reader_name = get_reader_name(target_voice, engine=engine_code)
 
-            self.send_message(
+            eng_desc = "ZeroTTS AI 48kHz" if engine_code == "zerotts" else ("Giọng AI VieNeu v3 Turbo - 48kHz" if engine_code == "vieneu" else "Vbee Cloud API")
+            step_desc = "Đang tổng hợp giọng nói đọc nguyên văn..." if is_direct else f"Đang biên soạn kịch bản {type_title} ({est_desc})..."
+            pod_msg = self.send_message(
                 chat_id,
-                f"🎙️ <b>Bắt đầu tạo Audio Podcast:</b> <code>{file_name}</code>\n"
-                f"🗣️ <b>Người dẫn chuyện:</b> Host {reader_name} (Giọng AI VieNeu v3 Turbo - 48kHz)\n"
-                f"🧠 Gemini đang biên soạn kịch bản đàm thoại và VieNeu TTS sinh âm thanh MP3 48kHz...\n"
-                f"<i>(Thời gian xử lý: khoảng 1 – 2 phút)</i>",
+                f"{icon} <b>Bắt đầu tạo {type_title}:</b> <code>{file_name}</code>\n"
+                f"🗣️ <b>Người đọc:</b> Host {reader_name} ({eng_desc})\n"
+                f"📊 <b>Tiến độ:</b> <code>{render_progress_bar(1, 3)}</code>\n"
+                f"📍 <i>{step_desc}</i>",
                 reply_to_message_id=msg_id,
                 thread_id=thread_id,
             )
+            pod_msg_id = pod_msg.get("result", {}).get("message_id") if pod_msg else None
 
-            start_time = time.time()
             podcast_input = target_path
-            clean_stem = stem.replace("_short", "")
+            clean_stem = (
+                stem.replace("_shortform", "")
+                .replace("_short", "")
+                .replace("_vn", "")
+                .replace("_VN", "")
+                .replace(".vi", "")
+                .replace("_vi", "")
+            )
+            clean_title = clean_stem.replace("_", " ").strip()
             short_candidate = OUTPUT_DIR / f"{clean_stem}_short.epub"
-            if short_candidate.exists() and not stem.endswith("_short"):
+            if short_candidate.exists() and not stem.lower().endswith(("_short", "_shortform")) and not is_direct:
                 podcast_input = short_candidate
 
-            podcast_speed = float(self.settings.get("podcast_speed", 1.1))
+            podcast_speed = float(self.settings.get("podcast_speed", 1.15))
             mp3_path = create_podcast_for_book(
                 input_file=podcast_input,
                 voice=target_voice,
+                engine=engine_code,
                 speed=podcast_speed,
                 send_telegram=False,
+                mode=mode,
             )
             dur = int(time.time() - start_time)
             dur_m, dur_s = dur // 60, dur % 60
 
+            if pod_msg_id:
+                self.edit_message_text(
+                    chat_id,
+                    pod_msg_id,
+                    f"{icon} <b>Đã tạo {type_title}:</b> <code>{clean_title}</code>\n"
+                    f"🗣️ <b>Giọng đọc:</b> {reader_name}\n"
+                    f"📊 <b>Tiến độ:</b> <code>{render_progress_bar(3, 3)}</code>\n"
+                    f"📍 <i>Đã tạo thành công! Đang gửi file âm thanh...</i>",
+                )
+
             if mp3_path and mp3_path.exists():
+                pod_tags_str = format_tags(generate_topic_tags(clean_stem, output_type="podcast"))
+                if is_direct:
+                    sub_desc = "Bản đọc âm thanh trọn vẹn toàn bộ nội dung bài viết"
+                elif is_deep:
+                    sub_desc = (
+                        "Bản Nghe Masterclass (20–30 phút) — Phân tích chi tiết cơ chế, phản biện đa chiều và ma trận hành động"
+                    )
+                else:
+                    sub_desc = "Bản Nghe Tinh Cất (8–12 phút) — Nắm bắt nhanh luận đề và 2–3 bài học cốt lõi"
+
+                header_title = f"{icon} <b>{clean_title}</b>"
+                audio_title = clean_title
+                engine_tag = "ZeroTTS" if engine_code == "zerotts" else ("VieNeu" if engine_code == "vieneu" else "Vbee")
+
+                is_long = (mp3_path.stat().st_size > 3 * 1024 * 1024) or is_deep
+                type_tag = "#podcast" if is_long else "#audio"
+                raw_tags = generate_topic_tags(clean_stem, output_type="")
+                kw_cands = [t for t in raw_tags if t.lower() not in ("#podcast", "#audio", "#short", "#dich", "#article", "#shortform", "#kienthuc")]
+                chosen_kw = kw_cands[0] if kw_cands else "#kienthuc"
+                if not chosen_kw.startswith("#"):
+                    chosen_kw = f"#{chosen_kw}"
+                desc_line = f"📝 {type_tag} {chosen_kw}"
+
                 caption = (
-                    f"🎙️ <b>Podcast Tóm Tắt: {clean_stem}</b>\n"
-                    f"🗣️ <b>Giọng đọc:</b> {reader_name} (AI VieNeu 48kHz • {podcast_speed}x)\n"
+                    f"{header_title}\n"
+                    f"🎧 {reader_name} ({engine_tag}, {podcast_speed}x)\n"
+                    f"{desc_line}\n"
                     f"⏱️ <b>Thời gian xử lý:</b> {dur_m}m{dur_s}s\n"
-                    f"🎧 <i>Hãy bấm Play để nghe ngay trên Telegram!</i>"
+                    f"🚗 <i>Đã đồng bộ vào Apple Podcasts (CarPlay)</i>"
                 )
                 self.send_audio(
                     chat_id,
                     mp3_path,
                     caption=caption,
-                    title=f"Podcast: {clean_stem}",
-                    performer=f"{reader_name} ({podcast_speed}x)",
+                    title=audio_title,
+                    performer=f"{reader_name} • {'Nguyên Văn' if is_direct else ('Chuyên Sâu' if is_deep else 'Tinh Gọn')} ({podcast_speed}x)",
                     reply_to_message_id=msg_id,
                     thread_id=thread_id,
                 )
                 if not is_already_in_group:
                     group_caption = (
-                        f"🎙️ <b>Podcast Tóm Tắt: {clean_stem}</b>\n"
-                        f"🗣️ <b>Giọng đọc:</b> {reader_name} (AI VieNeu 48kHz • {podcast_speed}x)\n"
-                        f"👤 <b>Yêu cầu bởi:</b> {sender_name}\n"
-                        f"⏱️ <b>Thời gian xử lý:</b> {dur_m}m{dur_s}s"
+                        f"{header_title}\n"
+                        f"🎧 {reader_name} ({engine_tag}, {podcast_speed}x)\n"
+                        f"{desc_line}\n"
+                        f"⏱️ <b>Thời gian xử lý:</b> {dur_m}m{dur_s}s\n"
+                        f"🚗 <i>Đã đồng bộ vào Apple Podcasts (CarPlay)</i>"
                     )
                     self.send_audio(
                         target_group_chat,
                         mp3_path,
                         caption=group_caption,
-                        title=f"Podcast: {clean_stem}",
-                        performer=f"{reader_name} ({podcast_speed}x)",
+                        title=audio_title,
+                        performer=f"{reader_name} • {'Nguyên Văn' if is_direct else ('Chuyên Sâu' if is_deep else 'Tinh Gọn')} ({podcast_speed}x)",
                         thread_id=target_group_topic,
                     )
             else:
+                err_token = uuid.uuid4().hex[:8]
+                job_to_save = job.copy()
+                job_to_save["timestamp"] = time.time()
+                self.pending_files[err_token] = job_to_save
+                self._save_pending_files()
+
+                action_map_rev = {
+                    "podcast_book": "pod_quick",
+                    "podcast_book_quick": "pod_quick",
+                    "podcast_book_deep": "pod_deep",
+                    "podcast_book_direct": "pod_direct",
+                    "sum_and_pod": "sum_pod",
+                    "sum_and_pod_quick": "sum_pod",
+                    "sum_and_pod_deep": "sum_deep_pod",
+                    "both": "both",
+                }
+                action_code = job.get("action") or action_map_rev.get(job_type, "pod_quick")
+                
+                keyboard = {"inline_keyboard": [
+                    [
+                        {"text": "🔄 Thử lại", "callback_data": f"{action_code}:{err_token}"}
+                    ]
+                ]}
+                
                 self.send_message(
                     chat_id,
-                    f"❌ Quá trình tạo Audio Podcast cho <b>{file_name}</b> gặp lỗi.\n"
-                    f"Vui lòng kiểm tra log hệ thống trên máy Mac.",
+                    f"❌ Quá trình tạo {type_title} cho <b>{file_name}</b> gặp lỗi.\n"
+                    f"Vui lòng thử lại hoặc kiểm tra log hệ thống.",
                     reply_to_message_id=msg_id,
                     thread_id=thread_id,
+                    reply_markup=keyboard,
                 )
+                return
 
         # Lưu bản gốc vào originals/ (chỉ khi file nằm trong INBOX_DIR)
         if target_path.exists() and target_path.parent == INBOX_DIR:
@@ -2035,6 +3522,345 @@ class TelegramBookBot:
                 shutil.move(str(target_path), str(dest_orig))
             except Exception:
                 pass
+
+    # ── 7b. Worker xử lý Bài viết từ URL (Dịch & Tạo Audio) ──
+    def process_article_job(self, job: dict[str, Any]) -> None:
+        job_type = job.get("type", "article_translate_audio")
+        url = job["url"]
+        chat_id = job["chat_id"]
+        thread_id = job.get("thread_id")
+        msg_id = job.get("msg_id")
+        sender_name = job.get("sender_name", "Bạn đọc")
+        active_model = self.settings.get("model", "gemini-3.7-flash")
+
+        needs_audio = "audio" in job_type or "podcast_deep" in job_type
+        is_summary = "summarize" in job_type
+        is_yt_podcast_deep = "yt_podcast_deep" in job_type
+
+        # 1. Gửi tin nhắn khởi tạo tiến độ
+        source_label = "video YouTube" if is_youtube_url(url) else "bài viết"
+        seg_notice = ""
+        if is_youtube_url(url):
+            if job.get("chapter"):
+                ch_title_desc = f": {job.get('chapter_title')}" if job.get("chapter_title") else ""
+                seg_notice = f"\n🎯 <b>Phân đoạn:</b> Chương {job['chapter']}{ch_title_desc}"
+            elif job.get("start_time") and job.get("end_time"):
+                seg_notice = f"\n🎯 <b>Phân đoạn:</b> {job['start_time']} - {job['end_time']}"
+            elif job.get("start_time"):
+                seg_notice = f"\n🎯 <b>Phân đoạn:</b> Từ mốc {job['start_time']}"
+
+        status_msg = self.send_message(
+            chat_id,
+            f"{'📺' if is_youtube_url(url) else '🌐'} <b>Bắt đầu xử lý {source_label}:</b> <code>{url}</code>{seg_notice}\n"
+            f"📊 <b>Tiến độ:</b> <code>[░░░░░░░░░░] 10%</code>\n"
+            f"📍 <i>Đang {'trích xuất phụ đề từ video' if is_youtube_url(url) else 'cào và trích xuất nội dung bài viết'}...</i>",
+            reply_to_message_id=msg_id,
+            thread_id=thread_id,
+        )
+        status_msg_id = status_msg.get("result", {}).get("message_id") if status_msg else None
+
+        # 2. Cào bài viết hoặc trích xuất phụ đề YouTube
+        is_yt = is_youtube_url(url)
+        try:
+            if is_yt:
+                article = youtube_to_article(
+                    url,
+                    start_time=job.get("start_time"),
+                    end_time=job.get("end_time"),
+                    chapter=job.get("chapter"),
+                )
+            else:
+                article = fetch_and_parse_article(url)
+        except Exception as e:
+            source_label = "phụ đề YouTube" if is_yt else "nội dung bài viết"
+            err_text = f"❌ Không thể trích xuất {source_label} từ liên kết: {e}"
+            if status_msg_id:
+                self.edit_message_text(chat_id, status_msg_id, err_text)
+            else:
+                self.send_message(chat_id, err_text, reply_to_message_id=msg_id, thread_id=thread_id)
+            return
+
+        # Cập nhật trạng thái sang dịch thuật
+        total_steps = 4 if is_yt_podcast_deep else (3 if needs_audio else 2)
+        if status_msg_id:
+            self.edit_message_text(
+                chat_id,
+                status_msg_id,
+                f"{'📺' if is_yt else '📰'} <b>{article.title}</b> ({article.domain})\n"
+                f"🧠 <b>Model:</b> <code>{active_model}</code>\n"
+                f"📊 <b>Tiến độ:</b> <code>{render_progress_bar(1, total_steps)}</code>\n"
+                f"📍 <i>Đang dịch {'transcript' if is_yt else 'bài viết'} sang tiếng Việt chuẩn xác...</i>",
+            )
+
+        # 3. Dịch bài viết
+        llm = LLMClient(model=active_model)
+
+        def on_translate_progress(detail: str, current_model: str) -> None:
+            if status_msg_id:
+                self.edit_message_text(
+                    chat_id,
+                    status_msg_id,
+                    f"{'📺' if is_yt else '📰'} <b>{article.title}</b> ({article.domain})\n"
+                    f"🧠 <b>Model:</b> <code>{current_model}</code>\n"
+                    f"📊 <b>Tiến độ:</b> <code>{render_progress_bar(1, total_steps)}</code>\n"
+                    f"📍 <i>{detail}</i>",
+                )
+
+        try:
+            translated = translate_article(article, llm=llm, on_progress=on_translate_progress)
+        except Exception as e:
+            err_text = f"❌ Lỗi khi dịch '{article.title}': {e}"
+            if status_msg_id:
+                self.edit_message_text(chat_id, status_msg_id, err_text)
+            else:
+                self.send_message(chat_id, err_text, reply_to_message_id=msg_id, thread_id=thread_id)
+            return
+
+        # 4. Tạo Audio nếu được yêu cầu
+        audio_path = None
+        if needs_audio:
+            engine_code = self.settings.get("engine", "zerotts")
+            voice_code = self.settings.get("voice")
+            target_voice = resolve_voice_code(voice_code, engine=engine_code)
+            reader_name = get_reader_name(target_voice, engine=engine_code)
+            podcast_speed = float(self.settings.get("podcast_speed", 1.15))
+
+            if is_yt_podcast_deep:
+                # Mode Podcast Chuyên Sâu: AI biên kịch lại nội dung thành kịch bản podcast
+                step_label = f"{render_progress_bar(2, total_steps)}"
+                if status_msg_id:
+                    self.edit_message_text(
+                        chat_id,
+                        status_msg_id,
+                        f"📺 <b>{translated.title_vi}</b>\n"
+                        f"🧠 <b>AI đang biên soạn kịch bản Podcast Chuyên Sâu...</b>\n"
+                        f"📊 <b>Tiến độ:</b> <code>{step_label}</code>\n"
+                        f"📍 <i>Chuyển đổi nội dung thành kịch bản podcast deep-dive...</i>",
+                    )
+
+                from generate_podcast import generate_podcast_script, call_vieneu_tts, PODCASTS_DIR
+                try:
+                    podcast_script = generate_podcast_script(
+                        text=translated.content_vi,
+                        book_title=translated.title_vi,
+                        voice_code=target_voice,
+                        mode="deep",
+                    )
+                except Exception as e:
+                    err_text = f"❌ Lỗi khi biên soạn kịch bản Podcast: {e}"
+                    if status_msg_id:
+                        self.edit_message_text(chat_id, status_msg_id, err_text)
+                    else:
+                        self.send_message(chat_id, err_text, reply_to_message_id=msg_id, thread_id=thread_id)
+                    return
+
+                # Lưu kịch bản podcast theo safe_stem của chapter
+                PODCASTS_DIR.mkdir(parents=True, exist_ok=True)
+                script_stem = article.safe_stem
+                script_path = PODCASTS_DIR / f"{script_stem}_script.txt"
+                script_path.write_text(podcast_script, encoding="utf-8")
+                print(f"📝 Đã lưu kịch bản Podcast YT tại: {script_path}")
+
+                # TTS kịch bản podcast
+                step_label = f"{render_progress_bar(3, total_steps)}"
+                if status_msg_id:
+                    self.edit_message_text(
+                        chat_id,
+                        status_msg_id,
+                        f"📺 <b>{translated.title_vi}</b>\n"
+                        f"🗣️ <b>Giọng đọc:</b> {reader_name}\n"
+                        f"📊 <b>Tiến độ:</b> <code>{step_label}</code>\n"
+                        f"📍 <i>Đang tổng hợp Audio Podcast Chuyên Sâu...</i>",
+                    )
+
+                audio_path = PODCASTS_DIR / f"{script_stem}.mp3"
+                engine_code = self.settings.get("engine", "zerotts")
+                success = call_tts(
+                    text=podcast_script,
+                    output_path=audio_path,
+                    voice=target_voice,
+                    engine=engine_code,
+                    speed=podcast_speed,
+                    fallback=True,
+                )
+                if not (success and audio_path.exists()):
+                    audio_path = None
+                    print(f"❌ Không thể tạo Audio Podcast cho {translated.title_vi}", file=sys.stderr)
+            else:
+                # Mode đọc toàn văn (Direct Narration)
+                if status_msg_id:
+                    self.edit_message_text(
+                        chat_id,
+                        status_msg_id,
+                        f"{'📺' if is_yt else '📰'} <b>{translated.title_vi}</b>\n"
+                        f"🗣️ <b>Giọng đọc:</b> {reader_name}\n"
+                        f"📊 <b>Tiến độ:</b> <code>{render_progress_bar(2, 3)}</code>\n"
+                        f"📍 <i>Đang tổng hợp Audio bản dịch...</i>",
+                    )
+
+                engine_code = self.settings.get("engine", "zerotts")
+                audio_path = generate_article_audio(
+                    translated=translated,
+                    voice=target_voice,
+                    speed=podcast_speed,
+                    engine=engine_code,
+                )
+
+        # 4.1 Tự động đồng bộ vào kho Podcast, lấy thumbnail YouTube làm Episode Cover và cập nhật Feed
+        yt_cover_path = None
+        if audio_path and audio_path.exists():
+            try:
+                import shutil
+                from ebook_translator.core.podcast_rss import update_podcast_feed
+
+                PODCASTS_DIR.mkdir(parents=True, exist_ok=True)
+                # Nếu file đang nằm ở output/articles, sao chép sang output/podcasts để phục vụ Apple Podcasts
+                if audio_path.parent.resolve() != PODCASTS_DIR.resolve():
+                    pod_dest = PODCASTS_DIR / audio_path.name
+                    try:
+                        shutil.copy2(audio_path, pod_dest)
+                        audio_path = pod_dest
+                    except Exception:
+                        pass
+
+                if is_yt:
+                    from ebook_translator.core.youtube import generate_youtube_podcast_cover
+                    from scripts.update_podcast_episode_covers import embed_cover_to_mp3
+
+                    ep_covers_dir = PODCASTS_DIR / "episode_covers"
+                    ep_covers_dir.mkdir(parents=True, exist_ok=True)
+                    clean_stem = (
+                        audio_path.stem
+                        .replace("_podcast_tinh_gon", "")
+                        .replace("_podcast_chuyen_sau", "")
+                        .replace("_podcast", "")
+                        .replace("_audio", "")
+                        .replace("_short_short", "")
+                        .replace("_short", "")
+                    )
+                    yt_cover_path = ep_covers_dir / f"{clean_stem}.jpg"
+                    if not yt_cover_path.exists():
+                        generate_youtube_podcast_cover(url, yt_cover_path)
+
+                    if yt_cover_path.exists():
+                        embed_cover_to_mp3(audio_path, yt_cover_path)
+
+                # Luôn cập nhật Private RSS Feed cho Apple Podcasts & CarPlay
+                update_podcast_feed()
+            except Exception as e:
+                print(f"⚠️ Lỗi xử lý đồng bộ podcast / cover: {e}", file=sys.stderr)
+
+        # 5. Cập nhật thông báo hoàn tất
+        if status_msg_id:
+            self.edit_message_text(
+                chat_id,
+                status_msg_id,
+                f"🎉 <b>Đã xử lý hoàn tất bài viết!</b>\n"
+                f"📰 <b>{translated.title_vi}</b>\n"
+                f"📍 <i>Đang gửi file âm thanh...</i>",
+            )
+
+        # 6. Gửi kết quả về Telegram:
+        article_tags_str = format_tags(getattr(translated, "tags", [])) or format_tags(
+            generate_topic_tags(translated.title_vi, translated.summary_vi, article.domain, output_type="article")
+        )
+
+        # A. Bản dịch văn bản — đã tắt, chỉ gửi audio
+        # (giữ article_tags_str để dùng cho audio_tags_str bên dưới)
+
+        # B. File Audio MP3
+        if audio_path and audio_path.exists():
+            engine_code = self.settings.get("engine", "zerotts")
+            target_voice = resolve_voice_code(self.settings.get("voice"), engine=engine_code)
+            reader_name = get_reader_name(target_voice, engine=engine_code)
+            podcast_speed = float(self.settings.get("podcast_speed", 1.15))
+            engine_label = "ZeroTTS" if engine_code == "zerotts" else ("VieNeu" if engine_code == "vieneu" else "Vbee")
+            source_icon = "🧠🎙️" if is_yt_podcast_deep else ("📺" if is_yt else "🌐")
+            audio_type = "Podcast Phân Tích (AI đúc kết)" if is_yt_podcast_deep else ("Bản Đọc" if is_yt else "Bản Đọc Nguyên Văn")
+            # Đánh giá file audio có dài không (>3MB tương đương ~3-5 phút, hoặc là podcast deep)
+            is_long = is_yt_podcast_deep or (audio_path.stat().st_size > 3 * 1024 * 1024)
+            type_tag = "#podcast" if is_long else "#audio"
+            
+            # 1 hashtag keyword theo nội dung/tiêu đề
+            raw_tags = generate_topic_tags(translated.title_vi, translated.summary_vi, article.domain, output_type="")
+            keyword_candidates = [
+                t for t in raw_tags
+                if t.lower() not in ("#podcast", "#audio", "#short", "#dich", "#article", "#shortform", "#kienthuc")
+            ]
+            if not keyword_candidates:
+                keyword_candidates = [t for t in raw_tags if t.lower() not in ("#podcast", "#audio", "#short", "#dich", "#article")]
+            chosen_kw = keyword_candidates[0] if keyword_candidates else "#kienthuc"
+            if not chosen_kw.startswith("#"):
+                chosen_kw = f"#{chosen_kw}"
+            
+            desc_line = f"📝 {type_tag} {chosen_kw}"
+
+            if article.is_chapter or article.chapter_title:
+                display_title = (article.chapter_title or translated.title_vi).strip()
+            else:
+                display_title = translated.title_vi.strip()
+
+            if getattr(article, "video_title", None):
+                caption_lines = [
+                    f"{source_icon} <b>{display_title}</b>",
+                    f"🎬 <b>Từ video:</b> <i>{article.video_title}</i>",
+                    f"👤: {article.author} • <b>Nguồn:</b> {article.domain}",
+                    f"🎧 {reader_name} ({engine_label}, {podcast_speed}x)",
+                    desc_line,
+                ]
+            else:
+                caption_lines = [
+                    f"{source_icon} <b>{display_title}</b>",
+                    f"🔗: {article.author} • <b>Nguồn:</b> {article.domain}",
+                    f"🎧 {reader_name} ({engine_label}, {podcast_speed}x)",
+                    desc_line,
+                ]
+            caption = "\n".join(caption_lines)
+            audio_title = display_title
+            self.send_audio(
+                chat_id,
+                audio_path,
+                caption=caption,
+                title=audio_title,
+                performer=f"{article.author} • {reader_name}",
+                reply_to_message_id=msg_id,
+                thread_id=thread_id,
+            )
+
+        # C. Đồng bộ sang nhóm/topic nếu người dùng chat riêng
+        target_group_chat = self.default_chat_id or -1003879100454
+        target_group_topic = self.default_topic_id or "365"
+        is_already_in_group = (
+            chat_id == target_group_chat
+            and str(thread_id or "") == str(target_group_topic)
+        )
+        if not is_already_in_group:
+            # Chỉ đồng bộ audio sang nhóm (không gửi markdown)
+            if audio_path and audio_path.exists():
+                if getattr(article, "video_title", None):
+                    sync_lines = [
+                        f"{source_icon} <b>{display_title}</b>",
+                        f"🎬 <b>Từ video:</b> <i>{article.video_title}</i>",
+                        f"👤: {article.author} • <b>Nguồn:</b> {article.domain}",
+                        f"🎧 {reader_name} ({engine_label}, {podcast_speed}x)",
+                        desc_line,
+                    ]
+                else:
+                    sync_lines = [
+                        f"{source_icon} <b>{display_title}</b>",
+                        f"🔗: {article.author} • <b>Nguồn:</b> {article.domain}",
+                        f"🎧 {reader_name} ({engine_label}, {podcast_speed}x)",
+                        desc_line,
+                    ]
+                sync_audio_cap = "\n".join(sync_lines)
+                self.send_audio(
+                    target_group_chat,
+                    audio_path,
+                    caption=sync_audio_cap,
+                    title=audio_title,
+                    performer=f"{article.author} • {reader_name}",
+                    thread_id=target_group_topic,
+                )
 
     # ── 8. Theo dõi thư mục output/ từ máy tính ──
     def output_watcher_loop(self) -> None:
@@ -2079,12 +3905,16 @@ class TelegramBookBot:
                             continue
 
                         # ĐÂY LÀ FILE DO USER TẠO TỪ MÁY MAC
-                        is_short = "_short" in fname
+                        is_short = "_short" in fname.lower() or "_shortform" in fname.lower()
                         type_tag = "⚡ [Tóm Tắt Shortform]" if is_short else "📖 [Bản Dịch Toàn Văn]"
                         clean_stem = (
-                            file_path.stem.replace("_short", "")
+                            file_path.stem.replace("_shortform", "")
+                            .replace("_short", "")
                             .replace(".vi", "")
                             .replace("_vi", "")
+                            .replace("_vn", "")
+                            .replace("_VN", "")
+                            .replace(".vn", "")
                             .replace("_", " ")
                         )
                         size_str = (
@@ -2161,9 +3991,12 @@ class TelegramBookBot:
     def register_bot_commands(self) -> None:
         commands = [
             {"command": "menu", "description": "📖 Menu & Hướng dẫn sử dụng bot"},
-            {"command": "podcast", "description": "🎙️ Tạo Audio Podcast tóm tắt sách (VieNeu AI)"},
+            {"command": "article", "description": "🌐 Dịch bài viết từ link & Tạo Audio"},
+            {"command": "podcast", "description": "🎙️ Tạo Audio Podcast tóm tắt sách (ZeroTTS 48kHz)"},
+            {"command": "rss", "description": "🚗 Link Private RSS cho Apple Podcasts & CarPlay"},
             {"command": "voice", "description": "🗣️ Chọn giọng đọc AI cho Podcast"},
-            {"command": "speed", "description": "⚡ Cài đặt tốc độ đọc Podcast (1.1x, 1.2x, 1.3x)"},
+            {"command": "engine", "description": "⚙️ Chọn công nghệ TTS (ZeroTTS, VieNeu, Vbee)"},
+            {"command": "speed", "description": "⚡ Cài đặt tốc độ đọc Podcast (1.1x, 1.15x, 1.2x)"},
             {"command": "recommend", "description": "🌟 Radar sách mới & High-rating tuần này"},
             {"command": "wishlist", "description": "📌 Danh sách sách muốn đọc đã lưu"},
             {"command": "library", "description": "📚 Thư viện sách đã dịch & tóm tắt"},
@@ -2210,6 +4043,14 @@ class TelegramBookBot:
 
         rec_scheduler = threading.Thread(target=self.weekly_recommendation_loop, daemon=True)
         rec_scheduler.start()
+
+        # Khởi động máy chủ Private Podcast RSS Server cho Apple Podcasts & CarPlay
+        try:
+            from podcast_server import start_server_in_background
+            start_server_in_background(port=8000)
+            print("📡 Private Podcast RSS Server đã khởi động ngầm trên cổng 8000")
+        except Exception as e:
+            print(f"⚠️ Không thể khởi động Podcast RSS Server: {e}")
 
         print("👂 Đang lắng nghe tài liệu, lệnh Dịch, Tóm tắt và Gợi ý Sách từ Telegram...")
 

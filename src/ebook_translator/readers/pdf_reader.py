@@ -45,7 +45,10 @@ def read_pdf(path: str, scan_texts: dict[int, str] | None = None) -> Book:
         if scan_texts and pno in scan_texts:
             blocks.extend(_blocks_from_markdown(scan_texts[pno]))
         else:
-            blocks.extend(_text_blocks(page, body_size))
+            table_blocks, table_rects = _table_blocks(page)
+            blocks.extend(table_blocks)
+            blocks.extend(_text_blocks(page, body_size, table_rects))
+            blocks.extend(_vector_blocks(doc, page, images, table_rects))
         blocks.extend(_image_blocks(doc, page, images, seen_xrefs))
         blocks.sort(key=lambda b: b.y)
         page_blocks.append(blocks)
@@ -83,11 +86,35 @@ def _dominant_font_size(doc: fitz.Document) -> float:
     return max(sizes.items(), key=lambda kv: kv[1])[0]
 
 
-def _text_blocks(page: fitz.Page, body_size: float) -> list[_Block]:
+def _table_blocks(page: fitz.Page) -> tuple[list[_Block], list[fitz.Rect]]:
+    result: list[_Block] = []
+    rects: list[fitz.Rect] = []
+    try:
+        tabs = page.find_tables()
+        for tab in tabs.tables:
+            html = ["<table>"]
+            for row in tab.extract():
+                html.append("<tr>")
+                for cell in row:
+                    escaped = html_mod.escape(str(cell).strip() if cell is not None else "")
+                    html.append(f"<td>{escaped}</td>")
+                html.append("</tr>")
+            html.append("</table>")
+            result.append(_Block(kind="table", y=tab.bbox[1], html="".join(html)))
+            rects.append(fitz.Rect(tab.bbox))
+    except Exception:
+        pass
+    return result, rects
+
+
+def _text_blocks(page: fitz.Page, body_size: float, table_rects: list[fitz.Rect]) -> list[_Block]:
     result: list[_Block] = []
     d = page.get_text("dict")
     for block in d.get("blocks", []):
         if block.get("type") != 0:
+            continue
+        rect = fitz.Rect(block["bbox"])
+        if any(tr.intersects(rect) or tr.contains(rect) for tr in table_rects):
             continue
         lines_text: list[str] = []
         max_size = 0.0
@@ -190,6 +217,61 @@ def _image_blocks(
                 html=f'<p class="image"><img src="{filename}" alt=""/></p>',
             )
         )
+    return result
+
+
+def _vector_blocks(doc: fitz.Document, page: fitz.Page, images: list[ImageAsset], table_rects: list[fitz.Rect]) -> list[_Block]:
+    result: list[_Block] = []
+    try:
+        paths = page.get_drawings()
+        if not paths:
+            return result
+        rects = []
+        for p in paths:
+            r = p["rect"]
+            if any(tr.intersects(r) or tr.contains(r) for tr in table_rects):
+                continue
+            if r.width > page.rect.width * 0.9 and r.height < 10:
+                continue
+            rects.append(r)
+        if not rects:
+            return result
+        clusters: list[fitz.Rect] = []
+        for r in rects:
+            added = False
+            for cluster in clusters:
+                expanded = fitz.Rect(cluster)
+                expanded.x0 -= 20; expanded.y0 -= 20
+                expanded.x1 += 20; expanded.y1 += 20
+                if expanded.intersects(r):
+                    cluster.include_rect(r)
+                    added = True
+                    break
+            if not added:
+                clusters.append(fitz.Rect(r))
+        for i, cluster in enumerate(clusters):
+            if cluster.width * cluster.height > 10000:
+                pix = page.get_pixmap(clip=cluster, dpi=150)
+                n = len(images) + 1
+                filename = f"images/vector_{page.number}_{i}_{n:04d}.png"
+                images.append(
+                    ImageAsset(
+                        id=f"vec_{n:04d}",
+                        filename=filename,
+                        data=pix.tobytes("png"),
+                        media_type="image/png",
+                        is_cover=False,
+                    )
+                )
+                result.append(
+                    _Block(
+                        kind="image",
+                        y=cluster.y0,
+                        html=f'<p class="image"><img src="{filename}" alt="Chart"/></p>'
+                    )
+                )
+    except Exception:
+        pass
     return result
 
 
