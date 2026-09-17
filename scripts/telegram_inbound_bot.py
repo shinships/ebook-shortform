@@ -89,6 +89,7 @@ VENV_PYTHON = VENV_BIN / "python"
 SETTINGS_PATH = LOGS_DIR / ".bot_settings.json"
 SENT_FILES_PATH = LOGS_DIR / ".sent_files.json"
 PENDING_FILES_PATH = LOGS_DIR / ".pending_files.json"
+PENDING_REELS_PATH = LOGS_DIR / ".pending_reels.json"
 PENDING_URLS_PATH = LOGS_DIR / ".pending_urls.json"
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
@@ -186,6 +187,7 @@ class TelegramBookBot:
         # Bộ nhớ tạm lưu file đang chờ người dùng bấm nút tương tác (lưu file để bảo toàn khi bot restart)
         self.pending_files: dict[str, dict[str, Any]] = self._load_pending_files()
         self.pending_urls: dict[str, dict[str, Any]] = self._load_pending_urls()
+        self.pending_reels: dict[str, dict[str, Any]] = self._load_pending_reels()
 
         # Quản lý theo dõi file output được tạo từ máy tính
         self.bot_processed_files: dict[str, float] = {}
@@ -247,6 +249,24 @@ class TelegramBookBot:
             PENDING_FILES_PATH.write_text(json.dumps(self.pending_files, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             print(f"[Pending] Lỗi lưu pending_files: {e}", file=sys.stderr)
+
+    def _load_pending_reels(self) -> dict[str, dict[str, Any]]:
+        if PENDING_REELS_PATH.exists():
+            try:
+                data = json.loads(PENDING_REELS_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    now = time.time()
+                    return {k: v for k, v in data.items() if now - v.get("timestamp", 0) < 172800}
+            except Exception:
+                pass
+        return {}
+
+    def _save_pending_reels(self) -> None:
+        try:
+            PENDING_REELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            PENDING_REELS_PATH.write_text(json.dumps(self.pending_reels, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            print(f"[Pending] Lỗi lưu pending_reels: {e}", file=sys.stderr)
 
     def _load_pending_urls(self) -> dict[str, dict[str, Any]]:
         if PENDING_URLS_PATH.exists():
@@ -407,6 +427,44 @@ class TelegramBookBot:
             return bool(res.get("ok"))
         except Exception as e:
             print(f"[Telegram] Lỗi sendDocument: {e}", file=sys.stderr)
+            return False
+
+    def send_video(
+        self,
+        chat_id: int | str,
+        file_path: Path,
+        caption: str | None = None,
+        reply_to_message_id: int | None = None,
+        thread_id: int | str | None = None,
+    ) -> bool:
+        """Gửi file Video MP4 chuẩn Telegram Video Player (dùng cho Short/Reel 9:16)."""
+        if not file_path.exists():
+            return False
+
+        data: dict[str, Any] = {"chat_id": chat_id, "supports_streaming": True}
+        if caption:
+            data["caption"] = caption
+            data["parse_mode"] = "HTML"
+        if reply_to_message_id:
+            data["reply_to_message_id"] = reply_to_message_id
+        if thread_id and str(thread_id).isdigit() and int(thread_id) > 0:
+            data["message_thread_id"] = int(thread_id)
+
+        try:
+            with open(file_path, "rb") as f:
+                files = {"video": (file_path.name, f, "video/mp4")}
+                r = requests.post(
+                    f"{self.api_url}/sendVideo",
+                    data=data,
+                    files=files,
+                    timeout=240,
+                )
+            res = r.json()
+            if not res.get("ok"):
+                print(f"[Telegram] Lỗi sendVideo: {res}", file=sys.stderr)
+            return bool(res.get("ok"))
+        except Exception as e:
+            print(f"[Telegram] Ngoại lệ sendVideo: {e}", file=sys.stderr)
             return False
 
     def send_audio(
@@ -1031,6 +1089,34 @@ class TelegramBookBot:
         if not self.is_authorized(from_user, chat):
             self.answer_callback_query(query_id, text="🔒 Bạn chưa có quyền thực hiện thao tác này.", show_alert=True)
             self.send_message(chat_id, "🔒 Bạn chưa có quyền thực hiện thao tác này.", thread_id=thread_id)
+            return
+
+        # ── Trường hợp bấm nút "🎬 Tạo Video Reel" từ 1 tập Podcast đã có sẵn ──
+        if data.startswith("make_reel:"):
+            reel_token = data.split(":", 1)[1]
+            info = self.pending_reels.get(reel_token)
+            if not info:
+                self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn. Vui lòng tạo Podcast mới!", show_alert=True)
+                return
+
+            self.answer_callback_query(query_id, text="🎬 Đã nhận yêu cầu! Đang tạo Video Reel...")
+            self.edit_message_text(
+                chat_id,
+                msg_id,
+                f"🎬 <b>{info.get('title', '')}</b>\n⏳ Đang tạo Video Reel 9:16 (bìa sách + phụ đề đồng bộ)... Vui lòng đợi 30–60 giây.",
+                reply_markup={"inline_keyboard": []},
+            )
+            self.job_queue.put({
+                "type": "make_reel_video",
+                "chat_id": info.get("chat_id", chat_id),
+                "thread_id": info.get("thread_id", thread_id),
+                "msg_id": msg_id,
+                "mp3_path": info.get("mp3_path"),
+                "script_path": info.get("script_path"),
+                "title": info.get("title"),
+            })
+            self.pending_reels.pop(reel_token, None)
+            self._save_pending_reels()
             return
 
         # ── Trường hợp chọn tác vụ cho file đang chờ hoặc link bài viết ──
@@ -2977,6 +3063,11 @@ class TelegramBookBot:
             self.process_article_job(job)
             return
 
+        # ── TRƯỜNG HỢP E: TẠO VIDEO REEL 9:16 TỪ TẬP PODCAST ──
+        if job_type == "make_reel_video":
+            self.process_reel_job(job)
+            return
+
         file_id = job.get("file_id")
         file_name = clean_book_filename(job.get("file_name", "book.epub"))
 
@@ -3464,6 +3555,30 @@ class TelegramBookBot:
                     reply_to_message_id=msg_id,
                     thread_id=thread_id,
                 )
+
+                # ── Gửi nút "🎬 Tạo Video Reel" cho phép xuất Short/Reel 9:16 từ chính tập Podcast này ──
+                if not is_direct:
+                    script_candidate = mp3_path.parent / f"{mp3_path.stem}_script.txt"
+                    reel_token = uuid.uuid4().hex[:8]
+                    self.pending_reels[reel_token] = {
+                        "mp3_path": str(mp3_path),
+                        "script_path": str(script_candidate) if script_candidate.exists() else "",
+                        "title": clean_title,
+                        "chat_id": chat_id,
+                        "thread_id": thread_id,
+                        "timestamp": time.time(),
+                    }
+                    self._save_pending_reels()
+                    self.send_message(
+                        chat_id,
+                        f"🎬 <b>{clean_title}</b>\nMuốn xuất thêm bản Video Short/Reel 9:16 (có phụ đề động) từ tập Podcast này không?",
+                        reply_to_message_id=msg_id,
+                        thread_id=thread_id,
+                        reply_markup={"inline_keyboard": [[
+                            {"text": "🎬 Tạo Video Reel", "callback_data": f"make_reel:{reel_token}"}
+                        ]]},
+                    )
+
                 if not is_already_in_group:
                     group_caption = (
                         f"{header_title}\n"
@@ -3524,6 +3639,66 @@ class TelegramBookBot:
                 pass
 
     # ── 7b. Worker xử lý Bài viết từ URL (Dịch & Tạo Audio) ──
+    # ── 7c. Worker xử lý tạo Video Reel 9:16 (Remotion) từ 1 tập Podcast có sẵn ──
+    def process_reel_job(self, job: dict[str, Any]) -> None:
+        chat_id = job["chat_id"]
+        thread_id = job.get("thread_id")
+        msg_id = job.get("msg_id")
+        title = job.get("title") or "Podcast Digest"
+        mp3_path = Path(job["mp3_path"])
+        script_path = job.get("script_path") or ""
+
+        EBOOK_SHORTFORM_ROOT = Path("/Users/mktmda/Projects/ebook-shortform")
+        render_script = EBOOK_SHORTFORM_ROOT / "scripts" / "render_short_reel.py"
+        venv_python = EBOOK_SHORTFORM_ROOT / ".venv" / "bin" / "python"
+
+        job_uid = uuid.uuid4().hex[:8]
+        out_file = EBOOK_SHORTFORM_ROOT / "output" / "reels" / f"{mp3_path.stem}_{job_uid}.mp4"
+
+        cmd = [
+            str(venv_python), str(render_script),
+            "--audio", str(mp3_path),
+            "--title", title,
+            "--duration", "45",
+            "--output", str(out_file),
+        ]
+        if script_path:
+            cmd += ["--script", script_path]
+
+        start_time = time.time()
+        try:
+            result = subprocess.run(
+                cmd, cwd=str(EBOOK_SHORTFORM_ROOT),
+                capture_output=True, text=True, timeout=600,
+            )
+        except Exception as e:
+            print(f"[Reel] Ngoại lệ khi render video: {e}", file=sys.stderr)
+            result = None
+
+        dur = int(time.time() - start_time)
+
+        if result is not None and result.returncode == 0 and out_file.exists():
+            self.send_video(
+                chat_id,
+                out_file,
+                caption=f"🎬 <b>{title}</b>\n⏱️ Đã tạo trong {dur}s\n📱 Video Reel 9:16 — sẵn sàng đăng TikTok/Reels/Shorts!",
+                reply_to_message_id=msg_id,
+                thread_id=thread_id,
+            )
+            try:
+                out_file.unlink()
+            except Exception:
+                pass
+        else:
+            err_tail = (result.stderr[-500:] if result and result.stderr else "Không rõ nguyên nhân")
+            print(f"[Reel] Lỗi render video cho {title}: {err_tail}", file=sys.stderr)
+            self.send_message(
+                chat_id,
+                f"❌ Không tạo được Video Reel cho <b>{title}</b>. Vui lòng thử lại sau.",
+                reply_to_message_id=msg_id,
+                thread_id=thread_id,
+            )
+
     def process_article_job(self, job: dict[str, Any]) -> None:
         job_type = job.get("type", "article_translate_audio")
         url = job["url"]
