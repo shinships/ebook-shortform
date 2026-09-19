@@ -35,6 +35,10 @@
         <string>1</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <!-- launchd khong nap shell profile, nen phai khai bao truc tiep o day.
+             Thieu bien nay thi feed.xml sinh ra bang IP LAN va Apple Podcasts mat anh bia. -->
+        <key>PODCAST_SERVER_BASE_URL</key>
+        <string>https://podcast.homnayai.com</string>
     </dict>
 </dict>
 </plist>

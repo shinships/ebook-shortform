@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mktmda.podcast-tunnel</string>
+
+    <!-- Cloudflare Tunnel dua localhost:8000 ra https://podcast.homnayai.com.
+         Dung LaunchAgent (khong phai LaunchDaemon) vi may chu podcast chay trong
+         bot Telegram - cung la LaunchAgent, chi len khi dang nhap. Tunnel len
+         som hon origin thi chi tra 502, khong ich gi. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/cloudflared</string>
+        <string>tunnel</string>
+        <string>--config</string>
+        <string>/Users/mktmda/Projects/ebook-shortform/deploy/cloudflared/config.yml</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mktmda/Projects/ebook-shortform</string>
+
+    <!-- Chay lien tuc, tu bat lai neu dut ket noi hoac crash -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Cho bot Telegram kip mo cong 8000 truoc, tranh vong lap restart vo ich -->
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mktmda/Projects/ebook-shortform/logs/podcast_tunnel.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mktmda/Projects/ebook-shortform/logs/podcast_tunnel.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>
