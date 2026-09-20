@@ -20,7 +20,9 @@ dependencies = [
     "json-repair>=0.30",
     "openai>=1.0",
     "yt-dlp>=2024.0",
+    "requests>=2.31",
     "faster-whisper>=1.2.1",
+    "numpy>=1.24",
 ]
 
 [project.scripts]

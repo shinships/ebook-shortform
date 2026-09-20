@@ -47,11 +47,14 @@ from ebook_translator.core.article import (
 )
 from ebook_translator.core.llm import LLMClient
 from ebook_translator.core.tags import format_tags, generate_topic_tags
+from ebook_translator.core.sponsorblock import ALL_CATEGORIES, CATEGORY_LABELS_VI, DEFAULT_CATEGORIES
 from ebook_translator.core.youtube import (
+    compact_chapter_spec,
     extract_time_from_url,
     format_time_str,
     get_youtube_chapters,
     is_youtube_url,
+    parse_chapter_spec,
     youtube_to_article,
 )
 from ebook_translator.recommender import CATEGORIES, SEED_RECOMMENDATIONS, book_recommender
@@ -66,9 +69,21 @@ from generate_podcast import (
     call_zerotts_tts,
     create_podcast_for_book,
     generate_podcast_script,
+    generate_critique_section,
+    build_full_podcast_turns,
+    render_full_podcast_episodes,
     get_reader_name,
     load_env,
     resolve_voice_code,
+)
+from ebook_translator.core.speakers import detect_speakers
+from ebook_translator.core.tts import (
+    pick_voices_for_cast,
+    describe_cast,
+    list_voices_by_gender,
+    voice_gender,
+    ensure_under_telegram_limit,
+    estimate_duration_sec,
 )
 from send_weekly_recommendations import build_recommendations_keyboard
 
@@ -91,6 +106,7 @@ SENT_FILES_PATH = LOGS_DIR / ".sent_files.json"
 PENDING_FILES_PATH = LOGS_DIR / ".pending_files.json"
 PENDING_REELS_PATH = LOGS_DIR / ".pending_reels.json"
 PENDING_URLS_PATH = LOGS_DIR / ".pending_urls.json"
+PENDING_CASTS_PATH = LOGS_DIR / ".pending_casts.json"
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
@@ -144,6 +160,37 @@ class ProcessResult:
     stderr: str
 
 
+# Nhận diện cách chọn chương trong tin nhắn. (?<![a-z]) chặn "ch" khớp nhầm
+# bên trong những từ như "watch 9".
+_CH_TOKEN = r"(?:chapters?|chương|chuong|ch)"
+_CH_RANGE_RE = re.compile(
+    rf"(?<![a-z]){_CH_TOKEN}\s*(\d{{1,3}}\s*(?:-|–|—|to|đến|den|tới|toi|→)\s*\d{{1,3}})\b"
+)
+_CH_LIST_RE = re.compile(
+    rf"(?<![a-z]){_CH_TOKEN}\s*(\d{{1,3}}(?:\s*[,+&]\s*\d{{1,3}})+)"
+)
+_CH_ONE_RE = re.compile(rf"(?<![a-z]){_CH_TOKEN}\s*(\d{{1,3}})\b")
+
+
+def _is_run(idxs: list[int]) -> bool:
+    """Danh sách chỉ số đã sort có liền mạch không."""
+    return bool(idxs) and idxs == list(range(idxs[0], idxs[-1] + 1))
+
+
+def _fmt_chapter_spec(spec: str | None) -> str:
+    """Hiển thị cách chọn chương cho người dùng: "9" / "9-11" / "2, 5"."""
+    if not spec:
+        return ""
+    idxs = parse_chapter_spec(spec)
+    if not idxs:
+        return str(spec)
+    if len(idxs) == 1:
+        return str(idxs[0])
+    if idxs == list(range(idxs[0], idxs[-1] + 1)):
+        return f"{idxs[0]}-{idxs[-1]}"
+    return ", ".join(str(i) for i in idxs)
+
+
 def render_progress_bar(current: int, total: int, width: int = 10) -> str:
     """Vẽ thanh trạng thái trực quan dạng [██████░░░░] 60%."""
     if total <= 0:
@@ -188,6 +235,7 @@ class TelegramBookBot:
         self.pending_files: dict[str, dict[str, Any]] = self._load_pending_files()
         self.pending_urls: dict[str, dict[str, Any]] = self._load_pending_urls()
         self.pending_reels: dict[str, dict[str, Any]] = self._load_pending_reels()
+        self.pending_casts: dict[str, dict[str, Any]] = self._load_pending_casts()
 
         # Quản lý theo dõi file output được tạo từ máy tính
         self.bot_processed_files: dict[str, float] = {}
@@ -214,6 +262,11 @@ class TelegramBookBot:
                 "hour": 9,  # 09:00 sáng
                 "last_sent_week": "",
             },
+            # Tự động cắt đoạn quảng cáo host tự đọc khi trích xuất phụ đề YouTube
+            "sponsorblock": {
+                "enabled": True,
+                "categories": list(DEFAULT_CATEGORIES),
+            },
         }
         if SETTINGS_PATH.exists():
             try:
@@ -230,6 +283,170 @@ class TelegramBookBot:
             SETTINGS_PATH.write_text(json.dumps(self.settings, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             print(f"[Settings] Lỗi lưu settings: {e}", file=sys.stderr)
+
+    def _sponsor_opts(self, job: dict[str, Any] | None = None) -> tuple[bool, list[str]]:
+        """Trả về (có cắt quảng cáo không, danh sách nhóm cần cắt).
+
+        _load_settings dùng default.update(data) — merge NÔNG, nên dict lồng
+        "sponsorblock" sẽ không tự có sub-key mới trên máy đã có file settings.
+        Vì vậy phải .get(..., mặc định) ở từng tầng.
+
+        job["skip_sponsors"] là None nếu người dùng không nói gì (dùng cài đặt),
+        False nếu họ yêu cầu giữ quảng cáo. Giải mặc định tại thời điểm chạy job
+        chứ không phải lúc xếp hàng, để /sponsorblock có hiệu lực ngay.
+        """
+        cfg = self.settings.get("sponsorblock") or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        enabled = bool(cfg.get("enabled", True))
+        cats = cfg.get("categories") or list(DEFAULT_CATEGORIES)
+        if not isinstance(cats, list) or not cats:
+            cats = list(DEFAULT_CATEGORIES)
+
+        if job is not None and job.get("skip_sponsors") is False:
+            enabled = False
+        return enabled, [str(c) for c in cats]
+
+    def _sponsor_panel(self) -> tuple[str, dict[str, Any]]:
+        """Dựng nội dung + bàn phím cho màn hình cài đặt /sponsorblock."""
+        enabled, cats = self._sponsor_opts()
+        state = "🟢 ĐANG BẬT" if enabled else "🔴 ĐANG TẮT"
+        active = ", ".join(CATEGORY_LABELS_VI.get(c, c) for c in cats) or "—"
+
+        text = (
+            f"🚫 <b>Cắt quảng cáo trong phụ đề (SponsorBlock)</b>\n"
+            f"Trạng thái: <b>{state}</b>\n"
+            f"Đang cắt: <i>{active}</i>\n\n"
+            f"<i>Chỉ áp dụng cho đoạn tài trợ do chính host đọc trong video — "
+            f"quảng cáo YouTube tự chèn vốn không nằm trong phụ đề.\n"
+            f"Muốn giữ quảng cáo cho riêng một link, gõ kèm \"giữ quảng cáo\".</i>"
+        )
+
+        rows: list[list[dict[str, str]]] = [[
+            {"text": "🟢 Bật" if not enabled else "✅ Đang bật", "callback_data": "sb_toggle:on"},
+            {"text": "🔴 Tắt" if enabled else "✅ Đang tắt", "callback_data": "sb_toggle:off"},
+        ]]
+        for cat in ALL_CATEGORIES:
+            mark = "✅" if cat in cats else "▫️"
+            rows.append([{
+                "text": f"{mark} {CATEGORY_LABELS_VI.get(cat, cat)}",
+                "callback_data": f"sb_cat:{cat}",
+            }])
+        return text, {"inline_keyboard": rows}
+
+    # ── Bàn phím chọn nhiều chương ──
+    # Trạng thái chọn nằm ở phía server trong pending_urls[token]["chapter_sel"],
+    # KHÔNG nhồi vào callback_data: payload phải ở dưới trần 64 byte của Telegram
+    # và tập chọn thì tăng không giới hạn.
+    _CH_PICKER_LIMIT = 18
+
+    def _render_chapter_picker(self, token: str, info: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        """Dựng màn hình chọn chương (tick nhiều chương). None nếu video không có chapter."""
+        chapters = get_youtube_chapters(info["url"])
+        if not chapters:
+            return None
+
+        sel = sorted(set(info.get("chapter_sel") or []))
+        shown = chapters[: self._CH_PICKER_LIMIT]
+
+        rows: list[list[dict[str, str]]] = []
+        for idx, ch in enumerate(shown, 1):
+            st = format_time_str(ch.get("start_time", 0))
+            title_clean = (ch.get("title") or f"Chương {idx}").strip()
+            title_short = (title_clean[:22] + "…") if len(title_clean) > 22 else title_clean
+            mark = "✅" if idx in sel else "  "
+            rows.append([{
+                "text": f"{mark}[{idx:02d}] {st} {title_short}",
+                "callback_data": f"yt_ch_tog:{token}_{idx}",
+            }])
+
+        footer: list[dict[str, str]] = []
+        if len(sel) >= 2 and not _is_run(sel):
+            gap = (sel[-1] - sel[0] + 1) - len(sel)
+            footer.append({
+                "text": f"↔️ Lấp đầy {sel[0]}-{sel[-1]} (+{gap})",
+                "callback_data": f"yt_ch_fill:{token}",
+            })
+        if sel:
+            footer.append({"text": "♻️ Bỏ chọn", "callback_data": f"yt_ch_clr:{token}"})
+        if footer:
+            rows.append(footer)
+        if sel:
+            rows.append([{
+                "text": f"✅ Xong ({len(sel)} chương)",
+                "callback_data": f"yt_ch_done:{token}",
+            }])
+        rows.append([{"text": "🔙 Quay lại menu chính", "callback_data": f"yt_back:{token}"}])
+
+        if sel:
+            picked_line = f"🎯 <b>Đang chọn:</b> <code>Chương {_fmt_chapter_spec(compact_chapter_spec(sel))}</code>"
+        else:
+            picked_line = "🎯 <i>Chưa chọn chương nào.</i>"
+
+        extra = ""
+        if len(chapters) > self._CH_PICKER_LIMIT:
+            extra = (
+                f"\n⚠️ <i>Chỉ hiện {self._CH_PICKER_LIMIT}/{len(chapters)} chương đầu. "
+                f"Chương sau hãy gõ trực tiếp, ví dụ <code>ch 20-22</code>.</i>"
+            )
+
+        text = (
+            f"📑 <b>Chọn chương muốn xử lý</b> (bấm để tick nhiều chương)\n"
+            f"🔗 <code>{info['url']}</code>\n"
+            f"{picked_line}{extra}"
+        )
+        return text, {"inline_keyboard": rows}
+
+    def _chapter_title_for(self, url: str, indices: list[int]) -> str:
+        """Tên hiển thị cho tập chương đã chọn (dùng cho tiêu đề bài/tên file)."""
+        try:
+            chapters = get_youtube_chapters(url)
+        except Exception:
+            return ""
+        valid = [i for i in indices if 1 <= i <= len(chapters)]
+        if not valid:
+            return ""
+
+        from ebook_translator.core.youtube import clean_chapter_raw_title
+
+        titles = [
+            clean_chapter_raw_title((chapters[i - 1].get("title") or f"Chương {i}").strip())
+            for i in valid
+        ]
+        if len(valid) == 1:
+            return titles[0]
+        if _is_run(valid):
+            return f"{titles[0]} → {titles[-1]}"
+        return f"{titles[0]} + {len(valid) - 1} chương"
+
+    def _render_format_menu(self, url_tok: str, info: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Menu chọn định dạng sau khi đã chốt phân đoạn."""
+        spec = info.get("chapter") or ""
+        ch_title = info.get("chapter_title") or ""
+        pretty = _fmt_chapter_spec(spec)
+        seg_label = f" (Chương {pretty})" if pretty else ""
+
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": f"🎙️ Đọc Toàn Văn{seg_label}", "callback_data": f"art_trans_pod:{url_tok}"}],
+                [{"text": f"🎧 Podcast Đầy Đủ + Phản Biện{seg_label}", "callback_data": f"yt_pod_full:{url_tok}"}],
+                [{"text": f"🎙️ Podcast Phân Tích{seg_label}", "callback_data": f"yt_pod_deep:{url_tok}"}],
+                [{"text": f"📝 Bản Dịch Chữ{seg_label}", "callback_data": f"art_trans:{url_tok}"}],
+                [{"text": "🔙 Chọn lại Chapter", "callback_data": f"yt_ch_list:{url_tok}"}],
+            ]
+        }
+        if ch_title and ch_title != f"Chương {pretty}":
+            display_ch = f"Chương {pretty}: {ch_title}"
+        else:
+            display_ch = f"Chương {pretty}" if pretty else "Toàn bộ video"
+
+        text = (
+            f"📺 <b>TIẾP NHẬN VIDEO YOUTUBE</b>\n"
+            f"🔗 <code>{info['url']}</code>\n"
+            f"🎯 <b>Phân đoạn đã chọn:</b> <code>{display_ch}</code>\n\n"
+            f"🎧 <b>Chọn định dạng muốn tạo:</b>"
+        )
+        return text, keyboard
 
     def _load_pending_files(self) -> dict[str, dict[str, Any]]:
         if PENDING_FILES_PATH.exists():
@@ -278,6 +495,24 @@ class TelegramBookBot:
             except Exception:
                 pass
         return {}
+
+    def _load_pending_casts(self) -> dict[str, dict[str, Any]]:
+        """Nạp state dàn giọng đang chờ người dùng xác nhận."""
+        try:
+            if PENDING_CASTS_PATH.exists():
+                return json.loads(PENDING_CASTS_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[Pending] Lỗi đọc pending_casts: {e}", file=sys.stderr)
+        return {}
+
+    def _save_pending_casts(self) -> None:
+        try:
+            PENDING_CASTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            PENDING_CASTS_PATH.write_text(
+                json.dumps(self.pending_casts, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as e:
+            print(f"[Pending] Lỗi lưu pending_casts: {e}", file=sys.stderr)
 
     def _save_pending_urls(self) -> None:
         try:
@@ -472,6 +707,123 @@ class TelegramBookBot:
             print(f"[Telegram] Ngoại lệ sendVideo: {e}", file=sys.stderr)
             return False
 
+    def _prepare_audio_under_limit(
+        self, file_path: Path, max_bytes: int = 48 * 1024 * 1024
+    ) -> Path:
+        """Nén audio MP3 nếu dung lượng vượt quá giới hạn Telegram Bot API (50MB)."""
+        if not file_path.exists() or file_path.stat().st_size <= max_bytes:
+            return file_path
+
+        cache_dir = PROJECT_DIR / "output" / ".cache" / "telegram_audio"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cached_compressed = cache_dir / f"{file_path.stem}_tg.mp3"
+
+        # Nếu đã có file nén trong cache và mới hơn file gốc, đồng thời <= max_bytes
+        if (
+            cached_compressed.exists()
+            and cached_compressed.stat().st_mtime >= file_path.stat().st_mtime
+            and 0 < cached_compressed.stat().st_size <= max_bytes
+        ):
+            return cached_compressed
+
+        # Xác định bitrate tối ưu dựa trên thời lượng audio
+        duration = 0.0
+        try:
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(file_path),
+            ]
+            out = subprocess.check_output(probe_cmd, stderr=subprocess.DEVNULL, timeout=10)
+            duration = float(out.strip())
+        except Exception:
+            pass
+
+        if duration > 0:
+            # Mục tiêu kích thước ~40MB an toàn dưới giới hạn 50MB
+            target_bps = int((40 * 1024 * 1024 * 8) / duration)
+            kbps = max(32, min(128, target_bps // 1000))
+        else:
+            kbps = 64
+
+        orig_mb = file_path.stat().st_size / (1024 * 1024)
+        print(
+            f"🔄 Audio '{file_path.name}' ({orig_mb:.1f}MB) vượt giới hạn Telegram (50MB). "
+            f"Đang nén xuống {kbps}kbps để gửi bot...",
+            file=sys.stderr,
+        )
+
+        try:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(file_path),
+                "-vn",
+                "-c:a", "libmp3lame",
+                "-b:a", f"{kbps}k",
+                "-ac", "1",
+                str(cached_compressed),
+            ]
+            subprocess.run(cmd, capture_output=True, check=True, timeout=300)
+
+            # Nếu vẫn vượt giới hạn (audio rất dài), thử nén tiếp ở 32kbps
+            if cached_compressed.exists() and cached_compressed.stat().st_size > max_bytes and kbps > 32:
+                cmd_fallback = [
+                    "ffmpeg", "-y",
+                    "-i", str(file_path),
+                    "-vn",
+                    "-c:a", "libmp3lame",
+                    "-b:a", "32k",
+                    "-ac", "1",
+                    str(cached_compressed),
+                ]
+                subprocess.run(cmd_fallback, capture_output=True, check=True, timeout=300)
+
+            if cached_compressed.exists() and cached_compressed.stat().st_size <= max_bytes:
+                comp_mb = cached_compressed.stat().st_size / (1024 * 1024)
+                print(f"✅ Đã nén audio thành công cho Telegram: {orig_mb:.1f}MB -> {comp_mb:.1f}MB", file=sys.stderr)
+                return cached_compressed
+        except Exception as err:
+            print(f"[Telegram] Lỗi khi nén audio bằng ffmpeg: {err}", file=sys.stderr)
+
+        return file_path
+
+    def _notify_audio_too_large(
+        self,
+        chat_id: int | str,
+        file_path: Path,
+        thread_id: int | str | None = None,
+        reply_to_message_id: int | None = None,
+        title: str | None = None,
+    ) -> None:
+        """Gửi thông báo thay thế khi file audio quá lớn không thể tải lên Telegram Bot API."""
+        try:
+            from ebook_translator.core.podcast_rss import get_base_url, get_feed_url
+            feed_url = get_feed_url()
+            base_url = get_base_url()
+            encoded_name = urllib.parse.quote(file_path.name)
+            stream_url = f"{base_url}/audio/{encoded_name}"
+            display_title = title or file_path.stem
+            size_mb = file_path.stat().st_size / (1024 * 1024)
+
+            fallback_msg = (
+                f"⚠️ <b>File Audio vượt giới hạn Telegram ({size_mb:.1f}MB &gt; 50MB)</b>\n"
+                f"Telegram Bot API giới hạn dung lượng tải lên trực tiếp tối đa là 50MB.\n\n"
+                f"🎧 <b>Tập:</b> {display_title}\n"
+                f"🔗 <b>Nghe / Tải trực tiếp:</b> <a href=\"{stream_url}\">Bấm vào đây để nghe</a>\n\n"
+                f"🚗 <b>Apple Podcasts (CarPlay):</b>\n"
+                f"Tập đã được đồng bộ vào kênh Podcast riêng của bạn. Mở app <i>Podcasts</i> trên iPhone để nghe!\n"
+                f"📡 Feed RSS: <code>{feed_url}</code>"
+            )
+            self.send_message(
+                chat_id,
+                fallback_msg,
+                reply_to_message_id=reply_to_message_id,
+                thread_id=thread_id,
+            )
+        except Exception as e:
+            print(f"[Telegram] Lỗi khi gửi thông báo audio quá lớn: {e}", file=sys.stderr)
+
     def send_audio(
         self,
         chat_id: int | str,
@@ -487,6 +839,9 @@ class TelegramBookBot:
         if not file_path.exists():
             print(f"❌ Không tìm thấy file audio: {file_path}", file=sys.stderr)
             return None
+
+        # Tự động nén nếu file vượt giới hạn 50MB của Telegram Bot API
+        upload_path = self._prepare_audio_under_limit(file_path)
 
         url = f"{self.api_url}/sendAudio"
         data: dict[str, Any] = {
@@ -520,7 +875,7 @@ class TelegramBookBot:
                 thumb = cand
 
         try:
-            with open(file_path, "rb") as f:
+            with open(upload_path, "rb") as f:
                 files: dict[str, Any] = {"audio": (file_path.name, f, "audio/mpeg")}
                 thumb_file = None
                 if thumb and thumb.exists() and thumb.stat().st_size > 0:
@@ -535,6 +890,35 @@ class TelegramBookBot:
                     res_data = resp.json()
                     if not res_data.get("ok"):
                         print(f"[Telegram] Lỗi sendAudio: {res_data}", file=sys.stderr)
+                        is_too_large = res_data.get("error_code") == 413 or "Too Large" in str(res_data.get("description", ""))
+                        if is_too_large and upload_path == file_path:
+                            # Ban đầu chưa nén mà bị 413 -> Thử nén khẩn cấp xuống <=35MB rồi retry
+                            retry_path = self._prepare_audio_under_limit(file_path, max_bytes=35 * 1024 * 1024)
+                            if retry_path != file_path and retry_path.exists():
+                                print(f"[Telegram] Thử gửi lại audio sau khi nén: {retry_path.name}", file=sys.stderr)
+                                with open(retry_path, "rb") as rf:
+                                    retry_files: dict[str, Any] = {"audio": (file_path.name, rf, "audio/mpeg")}
+                                    if thumb and thumb.exists() and thumb.stat().st_size > 0:
+                                        try:
+                                            with open(thumb, "rb") as rtf:
+                                                retry_files["thumbnail"] = (thumb.name, rtf, "image/jpeg")
+                                                retry_resp = requests.post(url, data=data, files=retry_files, timeout=240)
+                                        except Exception:
+                                            retry_resp = requests.post(url, data=data, files=retry_files, timeout=240)
+                                    else:
+                                        retry_resp = requests.post(url, data=data, files=retry_files, timeout=240)
+                                    retry_data = retry_resp.json()
+                                    if retry_data.get("ok"):
+                                        return retry_data
+                                    res_data = retry_data
+                        if res_data.get("error_code") == 413 or "Too Large" in str(res_data.get("description", "")):
+                            self._notify_audio_too_large(
+                                chat_id=chat_id,
+                                file_path=file_path,
+                                thread_id=thread_id,
+                                reply_to_message_id=reply_to_message_id,
+                                title=title,
+                            )
                     return res_data
                 finally:
                     if thumb_file:
@@ -860,7 +1244,7 @@ class TelegramBookBot:
                 return ent["url"].strip().rstrip(".,;!?)<>\"'")
         # 3. Đệ quy kiểm tra reply_to_message nếu có
         if msg.get("reply_to_message"):
-            return TelegramInboundBot.extract_url_from_message(msg["reply_to_message"])
+            return TelegramBookBot.extract_url_from_message(msg["reply_to_message"])
         return None
 
     # ── 3b. Tiếp nhận và phân tích liên kết bài viết (URL) ──
@@ -895,11 +1279,18 @@ class TelegramBookBot:
                 yt_start = range_m.group(1)
                 yt_end = range_m.group(2)
             else:
-                # 2. Chapter: "ch 8", "ch8", "chapter 8", "chương 8"
-                ch_m = re.search(r"(?:chapter|chương|ch)\s*(\d+)", text_raw)
-                if ch_m:
-                    yt_chapter = ch_m.group(1)
-                else:
+                # 2. Chapter: đơn lẻ "ch 8", dải "ch 9-11" / "chương 9 đến 11",
+                #    hoặc danh sách rời rạc "ch 9,10,11" / "chương 2 + 5".
+                #    (?<![a-z]) chặn "ch" khớp nhầm bên trong "watch 9".
+                ch_spec = None
+                for pattern in (_CH_RANGE_RE, _CH_LIST_RE, _CH_ONE_RE):
+                    m = pattern.search(text_raw)
+                    if m:
+                        ch_spec = m.group(1)
+                        break
+                if ch_spec:
+                    yt_chapter = compact_chapter_spec(parse_chapter_spec(ch_spec)) or None
+                if not yt_chapter:
                     # 3. Mốc đơn lẻ: "từ 45:48", "từ 2748", "start 45:48", "mốc 45:48"
                     single_m = re.search(r"(?:từ|start|bắt đầu|mốc)\s*(\d{1,2}:\d{2}(?::\d{2})?|\d+s?)", text_raw)
                     if single_m:
@@ -911,9 +1302,14 @@ class TelegramBookBot:
                 if url_t and url_t > 0:
                     yt_start = format_time_str(url_t)
 
+        # Người dùng có thể yêu cầu giữ nguyên quảng cáo
+        keep_ads = any(w in text_raw for w in [
+            "giữ quảng cáo", "giu quang cao", "keep ads", "no sponsorblock", "giữ ads",
+        ])
+
         seg_desc = ""
         if yt_chapter:
-            seg_desc = f" (Chương {yt_chapter})"
+            seg_desc = f" (Chương {_fmt_chapter_spec(yt_chapter)})"
         elif yt_start and yt_end:
             seg_desc = f" (Đoạn {yt_start} - {yt_end})"
         elif yt_start:
@@ -924,9 +1320,12 @@ class TelegramBookBot:
         has_trans = any(w in text_raw for w in ["dịch", "dich", "translate", "vietsub", "tiếng việt"])
         has_sum = any(w in text_raw for w in ["tóm tắt", "tom tat", "shortform", "summary", "brief"])
         has_deep = any(w in text_raw for w in ["sâu", "deep", "chuyên sâu", "deepdive", "podcast sâu", "podcast"])
+        has_full = any(w in text_raw for w in ["đầy đủ", "day du", "toàn bộ", "toan bo", "trọn vẹn", "full", "phản biện", "phan bien"])
 
         chosen_action: str | None = None
-        if has_deep and has_audio:
+        if is_yt and has_full and (has_audio or has_deep):
+            chosen_action = "yt_pod_full"
+        elif has_deep and has_audio:
             chosen_action = "yt_pod_deep" if is_yt else "art_sum_pod"
         elif has_trans and has_audio:
             chosen_action = "art_trans_pod"
@@ -945,6 +1344,7 @@ class TelegramBookBot:
             "art_sum_pod": "🎙️ Podcast Tinh Gọn",
             "art_sum": "📝 Tóm tắt ngắn",
             "yt_pod_deep": "🎙️ Podcast Phân Tích",
+            "yt_pod_full": "🎧 Podcast Đầy Đủ + Phản Biện",
         }
         job_types = {
             "art_trans_pod": "article_translate_audio",
@@ -952,6 +1352,7 @@ class TelegramBookBot:
             "art_sum_pod": "article_summarize_audio",
             "art_sum": "article_summarize",
             "yt_pod_deep": "article_yt_podcast_deep",
+            "yt_pod_full": "article_yt_podcast_full",
         }
 
         # Nếu đã có chỉ định rõ ràng qua lệnh hoặc từ khóa
@@ -975,6 +1376,7 @@ class TelegramBookBot:
                 "start_time": yt_start,
                 "end_time": yt_end,
                 "chapter": yt_chapter,
+                "skip_sponsors": False if keep_ads else None,
             })
             return
 
@@ -990,6 +1392,8 @@ class TelegramBookBot:
             "start_time": yt_start,
             "end_time": yt_end,
             "chapter": yt_chapter,
+            "skip_sponsors": False if keep_ads else None,
+            "chapter_sel": [],
         }
         self._save_pending_urls()
 
@@ -1007,6 +1411,9 @@ class TelegramBookBot:
             buttons = [
                 [
                     {"text": f"🎙️ Đọc Toàn Văn{seg_desc}", "callback_data": f"art_trans_pod:{url_token}"},
+                ],
+                [
+                    {"text": f"🎧 Podcast Đầy Đủ + Phản Biện{seg_desc}", "callback_data": f"yt_pod_full:{url_token}"},
                 ],
                 [
                     {"text": f"🎙️ Podcast Phân Tích{seg_desc}", "callback_data": f"yt_pod_deep:{url_token}"},
@@ -1039,6 +1446,7 @@ class TelegramBookBot:
             prompt_text += (
                 f"\n🎧 <b>Chọn định dạng bạn muốn tạo:</b>\n\n"
                 f"• 🎙️ <b>Đọc Toàn Văn:</b> Dịch và đọc trọn vẹn 100% phụ đề bằng giọng AI 48kHz.\n\n"
+                f"• 🎧 <b>Podcast Đầy Đủ + Phản Biện:</b> Đọc <b>trọn vẹn</b> nội dung gốc (tự đổi giọng nam/nữ theo từng người nói), cuối mỗi tập có thêm chương bình luận phản biện &amp; mở rộng. Video dài sẽ tự cắt thành nhiều tập.\n\n"
                 f"• 🎙️ <b>Podcast Phân Tích:</b> AI chắt lọc luận điểm cốt lõi và đúc kết thành buổi đàm thoại podcast lôi cuốn.\n\n"
                 f"• 📝 <b>Bản Dịch Chữ:</b> Chỉ dịch phụ đề sang tiếng Việt (văn bản)."
             )
@@ -1124,6 +1532,109 @@ class TelegramBookBot:
             self._save_pending_reels()
             return
 
+        # ── Xác nhận / chỉnh dàn giọng cho Podcast Đầy Đủ ──
+        if data.startswith(("cast_v:", "cast_go:", "cast_x:", "cast_set:")):
+            action_code, payload = data.split(":", 1)
+
+            if action_code == "cast_set":
+                token, sid, voice_idx = payload.rsplit("_", 2)
+            elif action_code == "cast_v":
+                token, sid = payload.rsplit("_", 1)
+            else:
+                token, sid = payload, None
+
+            cast = self.pending_casts.get(token)
+            if not cast:
+                self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
+                self.edit_message_text(chat_id, msg_id, "⚠️ <i>Phiên chọn giọng đã hết hạn.</i>",
+                                       reply_markup={"inline_keyboard": []})
+                return
+
+            if action_code == "cast_x":
+                self.answer_callback_query(query_id, text="Đã huỷ.")
+                Path(cast["turns_path"]).unlink(missing_ok=True)
+                self.pending_casts.pop(token, None)
+                self._save_pending_casts()
+                self.edit_message_text(chat_id, msg_id, "❌ <i>Đã huỷ tạo Podcast Đầy Đủ.</i>",
+                                       reply_markup={"inline_keyboard": []})
+                return
+
+            if action_code == "cast_go":
+                self.answer_callback_query(query_id, text="▶️ Bắt đầu render!")
+                cast["status_msg_id"] = msg_id
+                self._save_pending_casts()
+                self.edit_message_text(
+                    chat_id, msg_id,
+                    f"🎧 <b>{cast['title_vi']}</b>\n"
+                    f"🎭 {describe_cast(cast['voice_map'], cast['engine'])}\n"
+                    f"⏳ <i>Đã đưa vào hàng đợi render...</i>",
+                    reply_markup={"inline_keyboard": []},
+                )
+                self.job_queue.put({"type": "article_yt_podcast_render", "cast_token": token})
+                return
+
+            # cast_v: mở danh sách giọng thay thế cho một vai
+            if action_code == "cast_v":
+                current = cast["voice_map"].get(sid, "")
+                gender = voice_gender(current, cast["engine"]) or "male"
+                # Cho chọn cả nam lẫn nữ, ưu tiên nhóm giới tính hiện tại lên trước
+                opts = (
+                    list_voices_by_gender(cast["engine"], gender)
+                    + list_voices_by_gender(cast["engine"], "male" if gender == "female" else "female")
+                )
+                taken = {v for k, v in cast["voice_map"].items() if k != sid}
+                opts = [v for v in opts if v not in taken][:12]
+                cast["_opts"] = {str(i): v for i, v in enumerate(opts)}
+                self._save_pending_casts()
+
+                rows = []
+                for i, v in enumerate(opts):
+                    icon = "👩" if voice_gender(v, cast["engine"]) == "female" else "👨"
+                    mark = " ✅" if v == current else ""
+                    rows.append([{
+                        "text": f"{icon} {get_reader_name(v, cast['engine'])}{mark}",
+                        "callback_data": f"cast_set:{token}_{sid}_{i}",
+                    }])
+                rows.append([{"text": "🔙 Quay lại", "callback_data": f"cast_back:{token}"}])
+                sp_name = next((x.get("name") or x["id"] for x in cast["speakers"] if x["id"] == sid), sid)
+                self.answer_callback_query(query_id)
+                self.edit_message_text(
+                    chat_id, msg_id,
+                    f"🗣️ <b>Chọn giọng cho: {sp_name}</b>\n"
+                    f"<i>👨 = giọng nam · 👩 = giọng nữ</i>",
+                    reply_markup={"inline_keyboard": rows},
+                )
+                return
+
+            # cast_set: chốt giọng mới cho vai
+            if action_code == "cast_set":
+                picked = (cast.get("_opts") or {}).get(voice_idx)
+                if picked:
+                    cast["voice_map"][sid] = picked
+                    cast.pop("_opts", None)
+                    self._save_pending_casts()
+                    self.answer_callback_query(
+                        query_id, text=f"✅ {get_reader_name(picked, cast['engine'])}"
+                    )
+                else:
+                    self.answer_callback_query(query_id, text="⚠️ Lựa chọn không hợp lệ.")
+                self.edit_message_text(chat_id, msg_id, self._cast_summary_text(cast),
+                                       reply_markup=self._cast_keyboard(token, cast))
+                return
+
+        if data.startswith("cast_back:"):
+            token = data.split(":", 1)[1]
+            cast = self.pending_casts.get(token)
+            if not cast:
+                self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
+                return
+            cast.pop("_opts", None)
+            self._save_pending_casts()
+            self.answer_callback_query(query_id)
+            self.edit_message_text(chat_id, msg_id, self._cast_summary_text(cast),
+                                   reply_markup=self._cast_keyboard(token, cast))
+            return
+
         # ── Trường hợp chọn tác vụ cho file đang chờ hoặc link bài viết ──
         if ":" in data:
             action_code, token = data.split(":", 1)
@@ -1135,6 +1646,7 @@ class TelegramBookBot:
                 "art_sum_pod": ("article_summarize_audio", "🎙️ Podcast Tinh Gọn"),
                 "art_sum": ("article_summarize", "📝 Tóm tắt ngắn"),
                 "yt_pod_deep": ("article_yt_podcast_deep", "🎙️ Podcast Phân Tích"),
+                "yt_pod_full": ("article_yt_podcast_full", "🎧 Podcast Đầy Đủ + Phản Biện"),
             }
             if action_code in article_action_map:
                 job_type, action_desc = article_action_map[action_code]
@@ -1188,32 +1700,93 @@ class TelegramBookBot:
                     self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
                     return
                 self.answer_callback_query(query_id, text="📑 Đang tải danh sách Chapter...")
-                chapters = get_youtube_chapters(info["url"])
-                if not chapters:
+                panel = self._render_chapter_picker(token, info)
+                if panel is None:
                     self.answer_callback_query(query_id, text="ℹ️ Video này không có Chapters sẵn.", show_alert=True)
                     return
-
-                ch_buttons = []
-                for idx, ch in enumerate(chapters[:18], 1):
-                    st = format_time_str(ch.get("start_time", 0))
-                    title_clean = ch.get("title", f"Chương {idx}").strip()
-                    title_short = (title_clean[:22] + "…") if len(title_clean) > 22 else title_clean
-                    btn_text = f"[{idx:02d}] {st} {title_short}"
-                    ch_buttons.append([{"text": btn_text, "callback_data": f"yt_ch_pick:{token}_{idx}"}])
-
-                ch_buttons.append([{"text": "🔙 Quay lại menu chính", "callback_data": f"yt_back:{token}"}])
-
-                self.edit_message_text(
-                    chat_id,
-                    msg_id,
-                    f"📑 <b>Chọn Chapter bạn muốn xử lý:</b>\n"
-                    f"🔗 <code>{info['url']}</code>\n"
-                    f"📊 <i>Tổng cộng {len(chapters)} chương. Bấm vào một chương để xử lý:</i>",
-                    reply_markup={"inline_keyboard": ch_buttons},
-                )
+                text, keyboard = panel
+                self.edit_message_text(chat_id, msg_id, text, reply_markup=keyboard)
                 return
 
-            # Xử lý khi bấm chọn một chapter cụ thể
+            # Tick / bỏ tick một chương: yt_ch_tog:<token>_<idx>
+            if action_code == "yt_ch_tog":
+                url_tok, _, idx_str = token.rpartition("_")
+                info = self.pending_urls.get(url_tok)
+                if not info or not idx_str.isdigit():
+                    self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
+                    return
+
+                idx = int(idx_str)
+                sel = sorted(set(info.get("chapter_sel") or []))
+                if idx in sel:
+                    sel.remove(idx)
+                    note = f"Bỏ chương {idx}"
+                else:
+                    sel.append(idx)
+                    note = f"Đã chọn chương {idx}"
+                info["chapter_sel"] = sorted(sel)
+                self._save_pending_urls()
+
+                self.answer_callback_query(query_id, text=note)
+                panel = self._render_chapter_picker(url_tok, info)
+                if panel:
+                    text, keyboard = panel
+                    self.edit_message_text(chat_id, msg_id, text, reply_markup=keyboard)
+                return
+
+            # Lấp đầy khoảng giữa chương nhỏ nhất và lớn nhất đang chọn
+            if action_code == "yt_ch_fill":
+                info = self.pending_urls.get(token)
+                if not info:
+                    self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
+                    return
+                sel = sorted(set(info.get("chapter_sel") or []))
+                if len(sel) >= 2:
+                    info["chapter_sel"] = list(range(sel[0], sel[-1] + 1))
+                    self._save_pending_urls()
+                self.answer_callback_query(query_id, text=f"Đã chọn dải {sel[0]}-{sel[-1]}" if len(sel) >= 2 else "")
+                panel = self._render_chapter_picker(token, info)
+                if panel:
+                    text, keyboard = panel
+                    self.edit_message_text(chat_id, msg_id, text, reply_markup=keyboard)
+                return
+
+            # Bỏ toàn bộ lựa chọn
+            if action_code == "yt_ch_clr":
+                info = self.pending_urls.get(token)
+                if not info:
+                    self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
+                    return
+                info["chapter_sel"] = []
+                self._save_pending_urls()
+                self.answer_callback_query(query_id, text="Đã bỏ chọn")
+                panel = self._render_chapter_picker(token, info)
+                if panel:
+                    text, keyboard = panel
+                    self.edit_message_text(chat_id, msg_id, text, reply_markup=keyboard)
+                return
+
+            # Chốt lựa chọn nhiều chương → sang menu định dạng
+            if action_code == "yt_ch_done":
+                info = self.pending_urls.get(token)
+                if not info:
+                    self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
+                    return
+                sel = sorted(set(info.get("chapter_sel") or []))
+                if not sel:
+                    self.answer_callback_query(query_id, text="⚠️ Chưa chọn chương nào.", show_alert=True)
+                    return
+
+                info["chapter"] = compact_chapter_spec(sel)
+                info["chapter_title"] = self._chapter_title_for(info["url"], sel)
+                self._save_pending_urls()
+
+                self.answer_callback_query(query_id, text=f"✅ Đã chọn {len(sel)} chương!")
+                text, keyboard = self._render_format_menu(token, info)
+                self.edit_message_text(chat_id, msg_id, text, reply_markup=keyboard)
+                return
+
+            # Chọn nhanh đúng một chapter (giữ nguyên để bàn phím cũ vẫn chạy)
             if action_code == "yt_ch_pick":
                 if "_" in token:
                     url_tok, ch_num_str = token.rsplit("_", 1)
@@ -1224,43 +1797,15 @@ class TelegramBookBot:
                     self.answer_callback_query(query_id, text="⚠️ Yêu cầu đã hết hạn.", show_alert=True)
                     return
 
-                # Lấy tên chapter thực tế từ metadata
-                ch_title = f"Chương {ch_num_str}"
-                try:
-                    chapters = get_youtube_chapters(info["url"])
-                    ch_idx_int = int(ch_num_str) if ch_num_str.isdigit() else 1
-                    if 1 <= ch_idx_int <= len(chapters):
-                        raw_t = chapters[ch_idx_int - 1].get("title", ch_title).strip()
-                        from ebook_translator.core.youtube import clean_chapter_raw_title
-                        ch_title = clean_chapter_raw_title(raw_t)
-                except Exception:
-                    pass
-
-                info["chapter"] = ch_num_str
-                info["chapter_title"] = ch_title
+                ch_idx_int = int(ch_num_str) if ch_num_str.isdigit() else 1
+                info["chapter"] = str(ch_idx_int)
+                info["chapter_sel"] = [ch_idx_int]
+                info["chapter_title"] = self._chapter_title_for(info["url"], [ch_idx_int])
                 self._save_pending_urls()
 
-                self.answer_callback_query(query_id, text=f"✅ Đã chọn Chapter {ch_num_str}!")
-
-                seg_label = f" (Chương {ch_num_str})"
-                inline_keyboard = {
-                    "inline_keyboard": [
-                        [{"text": f"🎙️ Đọc Toàn Văn{seg_label}", "callback_data": f"art_trans_pod:{url_tok}"}],
-                        [{"text": f"🎙️ Podcast Phân Tích{seg_label}", "callback_data": f"yt_pod_deep:{url_tok}"}],
-                        [{"text": f"📝 Bản Dịch Chữ{seg_label}", "callback_data": f"art_trans:{url_tok}"}],
-                        [{"text": "🔙 Chọn lại Chapter", "callback_data": f"yt_ch_list:{url_tok}"}],
-                    ]
-                }
-                display_ch = f"Chương {ch_num_str}: {ch_title}" if ch_title and ch_title != f"Chương {ch_num_str}" else f"Chương {ch_num_str}"
-                self.edit_message_text(
-                    chat_id,
-                    msg_id,
-                    f"📺 <b>TIẾP NHẬN VIDEO YOUTUBE</b>\n"
-                    f"🔗 <code>{info['url']}</code>\n"
-                    f"🎯 <b>Phân đoạn đã chọn:</b> <code>{display_ch}</code>\n\n"
-                    f"🎧 <b>Chọn định dạng muốn tạo:</b>",
-                    reply_markup=inline_keyboard,
-                )
+                self.answer_callback_query(query_id, text=f"✅ Đã chọn Chapter {ch_idx_int}!")
+                text, keyboard = self._render_format_menu(url_tok, info)
+                self.edit_message_text(chat_id, msg_id, text, reply_markup=keyboard)
                 return
 
             if action_code == "yt_back":
@@ -1389,6 +1934,35 @@ class TelegramBookBot:
                     f"⚙️ <b>Cài đặt chế độ xử lý mặc định:</b>\n👉 <b>{mode_desc}</b>",
                     reply_markup={"inline_keyboard": []},
                 )
+                return
+
+            # ── Cắt quảng cáo: sb_toggle:<on|off> và sb_cat:<category> ──
+            elif action_code in ("sb_toggle", "sb_cat"):
+                cfg = self.settings.get("sponsorblock")
+                if not isinstance(cfg, dict):
+                    cfg = {"enabled": True, "categories": list(DEFAULT_CATEGORIES)}
+                    self.settings["sponsorblock"] = cfg
+
+                if action_code == "sb_toggle":
+                    cfg["enabled"] = token == "on"
+                    note = "Đã bật cắt quảng cáo" if cfg["enabled"] else "Đã tắt cắt quảng cáo"
+                else:
+                    cats = list(cfg.get("categories") or DEFAULT_CATEGORIES)
+                    if token in cats:
+                        cats.remove(token)
+                        note = f"Bỏ cắt: {CATEGORY_LABELS_VI.get(token, token)}"
+                    elif token in ALL_CATEGORIES:
+                        cats.append(token)
+                        note = f"Sẽ cắt: {CATEGORY_LABELS_VI.get(token, token)}"
+                    else:
+                        note = "Nhóm không hợp lệ"
+                    # Giữ thứ tự chuẩn để hiển thị ổn định
+                    cfg["categories"] = [c for c in ALL_CATEGORIES if c in cats]
+
+                self._save_settings()
+                self.answer_callback_query(query_id, text=note)
+                text, keyboard = self._sponsor_panel()
+                self.edit_message_text(chat_id, msg_id, text, reply_markup=keyboard)
                 return
 
             # ── Trường hợp chọn model: setmodel:<model> ──
@@ -2159,6 +2733,30 @@ class TelegramBookBot:
             )
             return
 
+        elif cmd in ("/sponsorblock", "/ads"):
+            if not self.is_authorized(from_user, chat):
+                self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+                return
+
+            cfg = self.settings.get("sponsorblock")
+            if not isinstance(cfg, dict):
+                cfg = {"enabled": True, "categories": list(DEFAULT_CATEGORIES)}
+                self.settings["sponsorblock"] = cfg
+
+            if arg.lower() in ("on", "off", "bật", "bat", "tắt", "tat"):
+                cfg["enabled"] = arg.lower() in ("on", "bật", "bat")
+                self._save_settings()
+
+            text, keyboard = self._sponsor_panel()
+            self.send_message(
+                chat_id,
+                text,
+                reply_to_message_id=msg_id,
+                thread_id=thread_id,
+                reply_markup=keyboard,
+            )
+            return
+
         elif cmd == "/model":
             if not self.is_authorized(from_user, chat):
                 self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
@@ -2832,6 +3430,75 @@ class TelegramBookBot:
             )
             return
 
+        # ── /heal hoặc /fix: Triệu hồi Antigravity Healer tự động sửa code ──
+        elif cmd in ("/heal", "/fix"):
+            if not self.is_authorized(from_user, chat):
+                self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+                return
+
+            req_desc = arg.strip() if arg else "Tự động phân tích và khắc phục sự cố hệ thống gần nhất"
+            self.send_message(
+                chat_id,
+                "🤖 <b>[Antigravity Healer] Đang phân tích và kích hoạt tự sửa lỗi...</b>\n"
+                f"📝 Yêu cầu: <i>{req_desc}</i>\n"
+                "⏳ <i>Vui lòng chờ trong giây lát, kết quả sửa code sẽ được báo cáo ngay tại đây.</i>",
+                reply_to_message_id=msg_id,
+                thread_id=thread_id,
+            )
+
+            def run_heal_async():
+                try:
+                    from antigravity_healer import heal_error
+                    context = arg
+                    tb_log = ""
+                    stderr_path = LOGS_DIR / "telegram_bot.stderr.log"
+                    if not context and stderr_path.exists():
+                        lines = stderr_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                        tb_log = "\n".join(lines[-60:])
+                        context = "Phát hiện sự cố từ 60 dòng cuối nhật ký telegram_bot.stderr.log."
+
+                    heal_error(
+                        error=arg or "Yêu cầu kiểm tra & sửa lỗi hệ thống từ người dùng",
+                        traceback_str=tb_log,
+                        failing_file="scripts/telegram_inbound_bot.py",
+                        context_info=context or "Triggered by Telegram /heal command",
+                        telegram_thread_id=thread_id or self.default_topic_id,
+                    )
+                except Exception as ex:
+                    print(f"[HealCommand] Lỗi khi chạy healer: {ex}", file=sys.stderr)
+
+            t = threading.Thread(target=run_heal_async, daemon=True)
+            t.start()
+            return
+
+        # ── /heallog: Xem lịch sử các lần Antigravity tự động sửa lỗi ──
+        elif cmd in ("/heallog", "/heal_status"):
+            if not self.is_authorized(from_user, chat):
+                self.send_message(chat_id, "🔒 Bạn chưa có quyền dùng bot.", thread_id=thread_id)
+                return
+
+            heals_dir = LOGS_DIR / "auto_heals"
+            if not heals_dir.exists():
+                self.send_message(chat_id, "ℹ️ Chưa có lịch sử tự sửa lỗi nào.", reply_to_message_id=msg_id, thread_id=thread_id)
+                return
+
+            log_files = sorted(heals_dir.glob("auto_heal_*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
+            if not log_files:
+                self.send_message(chat_id, "ℹ️ Chưa có nhật ký auto-heal nào được ghi nhận.", reply_to_message_id=msg_id, thread_id=thread_id)
+                return
+
+            lines = ["📋 <b>LỊCH SỬ ANTIGRAVITY AUTO-HEAL GẦN ĐÂY:</b>\n"]
+            for f in log_files[:6]:
+                dt_str = datetime.fromtimestamp(f.stat().st_mtime).strftime("%d/%m %H:%M:%S")
+                first_lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()[:10]
+                code_line = [l for l in first_lines if "EXIT CODE" in l]
+                status_icon = "✅" if (code_line and "0" in code_line[0]) else "⚠️"
+                lines.append(f"{status_icon} <code>{f.name}</code> ({dt_str})")
+
+            lines.append("\n💡 <i>Gõ <code>/heal &lt;mô tả lỗi&gt;</code> để yêu cầu Agent phân tích và sửa trực tiếp mã nguồn.</i>")
+            self.send_message(chat_id, "\n".join(lines), reply_to_message_id=msg_id, thread_id=thread_id)
+            return
+
     # ── 6. Helper định dạng Bản tóm tắt điều hành 1 trang ──
     def format_executive_brief(self, analysis_path: Path, stem: str) -> str:
         try:
@@ -3052,7 +3719,29 @@ class TelegramBookBot:
             try:
                 self.process_job(job)
             except Exception as e:
-                print(f"[Worker] Ngoại lệ khi xử lý job: {e}", file=sys.stderr)
+                import traceback
+                tb_str = traceback.format_exc()
+                print(f"[Worker] Ngoại lệ khi xử lý job: {e}\n{tb_str}", file=sys.stderr)
+                try:
+                    from antigravity_healer import heal_error
+                    job_type = job.get("type", "unknown")
+                    file_name = job.get("file_name", "")
+                    thread_id = job.get("thread_id") or self.default_topic_id
+
+                    def retry_job():
+                        print(f"[Worker] Tự động thử lại job sau khi sửa lỗi: {job_type} - {file_name}")
+                        self.process_job(job)
+
+                    heal_error(
+                        error=e,
+                        traceback_str=tb_str,
+                        failing_file="scripts/telegram_inbound_bot.py",
+                        context_info=f"Job Type: {job_type}, File: {file_name}, Chat: {job.get('chat_id')}",
+                        telegram_thread_id=thread_id,
+                        retry_fn=retry_job,
+                    )
+                except Exception as heal_err:
+                    print(f"[Worker] Lỗi triệu hồi healer: {heal_err}", file=sys.stderr)
             finally:
                 self.job_queue.task_done()
 
@@ -3064,7 +3753,13 @@ class TelegramBookBot:
         sender_name = job.get("sender_name", "Bạn đọc")
 
         # ── TRƯỜNG HỢP D: XỬ LÝ BÀI VIẾT TỪ LIÊN KẾT (URL) ──
-        if job_type.startswith("article_"):
+        if job_type == "article_yt_podcast_full":
+            self.process_yt_full_podcast_job(job)
+            return
+        elif job_type == "article_yt_podcast_render":
+            self.process_yt_full_podcast_render(job)
+            return
+        elif job_type.startswith("article_"):
             self.process_article_job(job)
             return
 
@@ -3683,10 +4378,16 @@ class TelegramBookBot:
             cmd += ["--script", script_path]
 
         start_time = time.time()
+
+        run_env = os.environ.copy()
+        if "/Users/mktmda/.local/bin" not in run_env.get("PATH", ""):
+            run_env["PATH"] = f"/Users/mktmda/.local/bin:/opt/homebrew/bin:{run_env.get('PATH', '')}"
+
         try:
             result = subprocess.run(
                 cmd, cwd=str(EBOOK_SHORTFORM_ROOT),
                 capture_output=True, text=True, timeout=600,
+                env=run_env
             )
         except Exception as e:
             print(f"[Reel] Ngoại lệ khi render video: {e}", file=sys.stderr)
@@ -3715,6 +4416,359 @@ class TelegramBookBot:
                 reply_to_message_id=msg_id,
                 thread_id=thread_id,
             )
+
+    # ── Chế độ Podcast Đầy Đủ + Phản Biện (YouTube, đa giọng, nhiều tập) ──
+
+    def _cast_keyboard(self, token: str, cast: dict[str, Any]) -> dict[str, Any]:
+        """Bàn phím xác nhận dàn giọng: đổi giọng từng vai + nút bắt đầu render."""
+        rows = []
+        for sp in cast["speakers"]:
+            sid = sp["id"]
+            voice = cast["voice_map"].get(sid, "")
+            reader = get_reader_name(voice, engine=cast["engine"])
+            gender_icon = "👩" if voice_gender(voice, cast["engine"]) == "female" else "👨"
+            rows.append([{
+                "text": f"🔄 {sp.get('name') or sid}: {gender_icon} {reader}",
+                "callback_data": f"cast_v:{token}_{sid}",
+            }])
+        rows.append([{"text": "▶️ Bắt đầu render", "callback_data": f"cast_go:{token}"}])
+        rows.append([{"text": "❌ Huỷ", "callback_data": f"cast_x:{token}"}])
+        return {"inline_keyboard": rows}
+
+    def _cast_summary_text(self, cast: dict[str, Any]) -> str:
+        lines = [
+            f"🎭 <b>XÁC NHẬN DÀN GIỌNG</b>",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"📺 <b>{cast['title_vi']}</b>",
+            f"🗣️ Phát hiện <b>{len(cast['speakers'])} người nói</b> (nguồn: {cast['source']})",
+            "",
+        ]
+        for sp in cast["speakers"]:
+            voice = cast["voice_map"].get(sp["id"], "")
+            reader = get_reader_name(voice, engine=cast["engine"])
+            gen = voice_gender(voice, cast["engine"])
+            gender_icon = "👩 Nữ" if gen == "female" else "👨 Nam"
+            role_vi = "Người dẫn" if sp.get("role") == "host" else "Khách mời"
+            detected = {"male": "nam", "female": "nữ"}.get(sp.get("gender"), "chưa rõ")
+            lines.append(
+                f"• <b>{sp.get('name') or sp['id']}</b> ({role_vi}, AI đoán: {detected})\n"
+                f"   → {gender_icon} <b>{reader}</b>"
+            )
+        lines += [
+            "",
+            f"⏱️ Dự kiến <b>{cast['est_minutes']:.0f} phút</b> → <b>{cast['n_episodes']} tập</b>",
+            f"🎙️ Phần phản biện đọc bằng giọng dẫn: <b>{cast['host_reader']}</b>",
+            "",
+            "<i>Bấm vào một vai để đổi giọng, hoặc bấm ▶️ để bắt đầu.</i>",
+        ]
+        return "\n".join(lines)
+
+    def process_yt_full_podcast_job(self, job: dict[str, Any]) -> None:
+        """Podcast Đầy Đủ: toàn văn nội dung gốc + đa giọng theo người nói + phản biện cuối tập."""
+        url = job["url"]
+        chat_id = job["chat_id"]
+        thread_id = job.get("thread_id")
+        msg_id = job.get("msg_id")
+        active_model = self.settings.get("model", "gemini-3.7-flash")
+        engine_code = self.settings.get("engine", "zerotts")
+        host_voice = resolve_voice_code(self.settings.get("voice"), engine=engine_code)
+        host_reader = get_reader_name(host_voice, engine=engine_code)
+        speed = float(self.settings.get("podcast_speed", 1.15))
+
+        total_steps = 6
+        status = self.send_message(
+            chat_id,
+            f"🎧 <b>PODCAST ĐẦY ĐỦ + PHẢN BIỆN</b>\n"
+            f"🔗 <code>{url}</code>\n"
+            f"📊 <code>{render_progress_bar(1, total_steps)}</code>\n"
+            f"📍 <i>Đang tải phụ đề video...</i>",
+            reply_to_message_id=msg_id,
+            thread_id=thread_id,
+        )
+        status_msg_id = (status or {}).get("result", {}).get("message_id")
+
+        def upd(step: int, text: str) -> None:
+            if status_msg_id:
+                self.edit_message_text(
+                    chat_id, status_msg_id,
+                    f"🎧 <b>PODCAST ĐẦY ĐỦ + PHẢN BIỆN</b>\n"
+                    f"📊 <code>{render_progress_bar(step, total_steps)}</code>\n"
+                    f"📍 <i>{text}</i>",
+                )
+
+        def fail(text: str) -> None:
+            if status_msg_id:
+                self.edit_message_text(chat_id, status_msg_id, text)
+            else:
+                self.send_message(chat_id, text, reply_to_message_id=msg_id, thread_id=thread_id)
+
+        # 1. Lấy transcript
+        try:
+            sb_on, sb_cats = self._sponsor_opts(job)
+            article = youtube_to_article(
+                url,
+                start_time=job.get("start_time"),
+                end_time=job.get("end_time"),
+                chapter=job.get("chapter"),
+                skip_sponsors=sb_on,
+                sponsor_categories=sb_cats,
+            )
+        except Exception as e:
+            fail(f"❌ Không lấy được phụ đề video: {e}")
+            return
+
+        if article.sponsor_note:
+            upd(2, f"🚫 Đã cắt {article.sponsor_note}")
+
+        video_info = {
+            "title": getattr(article, "video_title", "") or article.title,
+            "channel": article.author,
+            "description": "",
+        }
+
+        # 2. Phân vai người nói (trên transcript GỐC, nơi marker >> còn nguyên)
+        upd(2, "Đang nhận diện người nói trong video...")
+        try:
+            llm = LLMClient(model=active_model)
+        except Exception:
+            llm = None
+        try:
+            plan = detect_speakers(article.text, video_info, llm=llm)
+        except Exception as e:
+            print(f"⚠️ Phân vai lỗi, chuyển sang một giọng: {e}", file=sys.stderr)
+            from ebook_translator.core.speakers import SpeakerPlan, Speaker
+            plan = SpeakerPlan(
+                speakers=[Speaker(id="S1", name="Người dẫn", role="host")],
+                turns=[("S1", article.text)], source="single",
+            )
+
+        # 3. Dịch THEO LƯỢT để ranh giới người nói còn khớp với bản tiếng Việt
+        upd(3, f"Đang dịch toàn văn ({len(plan.turns)} lượt nói)...")
+        try:
+            from ebook_translator.core.article import translate_turns
+            vi_turns = translate_turns(
+                plan.turns,
+                llm=llm,
+                title=article.title,
+                author=article.author,
+                on_progress=lambda d, m: upd(3, d),
+            )
+        except Exception as e:
+            fail(f"❌ Lỗi khi dịch nội dung: {e}")
+            return
+        if not vi_turns:
+            fail("❌ Bản dịch rỗng, không thể tạo podcast.")
+            return
+
+        # Tiêu đề tiếng Việt
+        try:
+            title_vi = llm.complete(
+                system="Dịch tiêu đề sau sang tiếng Việt tự nhiên, súc tích, không thêm ngoặc hay giải thích:",
+                messages=[{"role": "user", "content": article.title}],
+                max_tokens=100,
+            ).strip().strip('"\'*#')
+        except Exception:
+            title_vi = article.title
+
+        # 4. Phân vai giọng đọc theo giới tính
+        roster = plan.gender_roster(default_gender=voice_gender(host_voice, engine_code) or "male")
+        voice_map = pick_voices_for_cast(roster, engine=engine_code, host_voice=host_voice)
+        voice_map["HOST"] = host_voice
+        print(f"🎭 Dàn giọng: {describe_cast(voice_map, engine_code)}")
+
+        total_chars = sum(len(t) for _, t in vi_turns)
+        est_minutes = estimate_duration_sec("x" * total_chars, engine_code, speed) / 60
+        bitrate_kbps = 128 if est_minutes > 25 else 192
+
+        # Lưu state để render sau khi người dùng xác nhận
+        token = uuid.uuid4().hex[:12]
+        PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
+        turns_path = PROCESSING_DIR / f"full_podcast_{token}.json"
+        turns_path.write_text(
+            json.dumps({"turns": vi_turns}, ensure_ascii=False), encoding="utf-8"
+        )
+
+        n_est = max(1, round(est_minutes / (40 if bitrate_kbps == 128 else 32)))
+        cast = {
+            "token": token,
+            "url": url,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "msg_id": msg_id,
+            "status_msg_id": status_msg_id,
+            "turns_path": str(turns_path),
+            "title_vi": title_vi,
+            "safe_stem": article.safe_stem,
+            "author": article.author,
+            "domain": article.domain,
+            "video_title": getattr(article, "video_title", "") or "",
+            "video_info": video_info,
+            "engine": engine_code,
+            "speed": speed,
+            "bitrate_kbps": bitrate_kbps,
+            "host_voice": host_voice,
+            "host_reader": host_reader,
+            "voice_map": voice_map,
+            "speakers": [
+                {"id": sp.id, "name": sp.name, "gender": sp.gender, "role": sp.role}
+                for sp in plan.speakers
+            ],
+            "source": plan.source,
+            "est_minutes": est_minutes,
+            "n_episodes": n_est,
+            "created": time.time(),
+        }
+        self.pending_casts[token] = cast
+        self._save_pending_casts()
+
+        # Chỉ hỏi xác nhận khi thực sự có nhiều người nói
+        if not plan.is_multi:
+            upd(4, "Chỉ có một người nói — bỏ qua bước chọn giọng, bắt đầu render...")
+            self.job_queue.put({"type": "article_yt_podcast_render", "cast_token": token})
+            return
+
+        if status_msg_id:
+            self.edit_message_text(
+                chat_id, status_msg_id, self._cast_summary_text(cast),
+                reply_markup=self._cast_keyboard(token, cast),
+            )
+        else:
+            self.send_message(
+                chat_id, self._cast_summary_text(cast),
+                reply_to_message_id=msg_id, thread_id=thread_id,
+                reply_markup=self._cast_keyboard(token, cast),
+            )
+
+    def process_yt_full_podcast_render(self, job: dict[str, Any]) -> None:
+        """Render + xuất bản các tập của Podcast Đầy Đủ sau khi dàn giọng đã chốt."""
+        token = job.get("cast_token")
+        cast = self.pending_casts.get(token)
+        if not cast:
+            print(f"⚠️ Không tìm thấy state dàn giọng {token}", file=sys.stderr)
+            return
+
+        chat_id = cast["chat_id"]
+        thread_id = cast.get("thread_id")
+        msg_id = cast.get("msg_id")
+        status_msg_id = cast.get("status_msg_id")
+        engine_code = cast["engine"]
+        speed = cast["speed"]
+        turns_path = Path(cast["turns_path"])
+
+        def upd(text: str) -> None:
+            if status_msg_id:
+                self.edit_message_text(
+                    chat_id, status_msg_id,
+                    f"🎧 <b>{cast['title_vi']}</b>\n"
+                    f"🎭 {describe_cast(cast['voice_map'], engine_code)}\n"
+                    f"📍 <i>{text}</i>",
+                )
+
+        try:
+            vi_turns = [tuple(t) for t in json.loads(turns_path.read_text(encoding="utf-8"))["turns"]]
+        except Exception as e:
+            self.send_message(chat_id, f"❌ Mất dữ liệu kịch bản: {e}", reply_to_message_id=msg_id, thread_id=thread_id)
+            return
+
+        try:
+            from ebook_translator.core.speakers import SpeakerPlan, Speaker
+            plan = SpeakerPlan(
+                speakers=[Speaker(**sp) for sp in cast["speakers"]],
+                turns=vi_turns, source=cast["source"],
+            )
+
+            upd("Đang biên soạn chương phản biện và chia tập...")
+            episodes = build_full_podcast_turns(
+                vi_turns=vi_turns,
+                title_vi=cast["title_vi"],
+                reader_name=cast["host_reader"],
+                speaker_plan=plan,
+                video_info=cast["video_info"],
+                engine=engine_code,
+                speed=speed,
+                bitrate_kbps=cast["bitrate_kbps"],
+                llm=LLMClient(model=self.settings.get("model", "gemini-3.7-flash")),
+            )
+            if not episodes:
+                self.send_message(chat_id, "❌ Không dựng được kịch bản podcast.", reply_to_message_id=msg_id, thread_id=thread_id)
+                return
+
+            # Lưu kịch bản để đối chiếu
+            PODCASTS_DIR.mkdir(parents=True, exist_ok=True)
+            for i, ep in enumerate(episodes, 1):
+                suffix = f"_phan_{i:02d}" if len(episodes) > 1 else ""
+                (PODCASTS_DIR / f"{cast['safe_stem']}{suffix}_script.txt").write_text(
+                    "\n\n".join(f"[{sid}] {text}" for sid, text in ep), encoding="utf-8"
+                )
+
+            def on_prog(ep_i: int, ep_n: int, cur: int, total: int) -> None:
+                if cur % 5 == 0 or cur == total:
+                    upd(f"Đang tổng hợp giọng — tập {ep_i}/{ep_n}, lượt {cur}/{total}...")
+
+            upd(f"Đang tổng hợp {len(episodes)} tập audio đa giọng...")
+            paths = render_full_podcast_episodes(
+                episodes=episodes,
+                base_output=PODCASTS_DIR / f"{cast['safe_stem']}.mp3",
+                voice_map=cast["voice_map"],
+                engine=engine_code,
+                speed=speed,
+                bitrate=f"{cast['bitrate_kbps']}k",
+                progress=on_prog,
+            )
+            if not paths:
+                self.send_message(chat_id, "❌ Không render được tập nào.", reply_to_message_id=msg_id, thread_id=thread_id)
+                return
+
+            # Ảnh bìa + RSS
+            try:
+                from ebook_translator.core.podcast_rss import embed_cover_to_mp3, update_podcast_feed
+                from ebook_translator.core.youtube import generate_youtube_podcast_cover
+
+                ep_covers_dir = PODCASTS_DIR / "episode_covers"
+                ep_covers_dir.mkdir(parents=True, exist_ok=True)
+                cover = ep_covers_dir / f"{cast['safe_stem']}.jpg"
+                if not cover.exists():
+                    generate_youtube_podcast_cover(cast["url"], cover)
+                if cover.exists():
+                    for pth in paths:
+                        embed_cover_to_mp3(pth, cover)
+                        ensure_under_telegram_limit(pth)
+                update_podcast_feed()
+            except Exception as e:
+                print(f"⚠️ Lỗi cover/RSS: {e}", file=sys.stderr)
+
+            if status_msg_id:
+                self.edit_message_text(
+                    chat_id, status_msg_id,
+                    f"🎉 <b>Hoàn tất!</b>\n"
+                    f"🎧 <b>{cast['title_vi']}</b>\n"
+                    f"🎭 {describe_cast(cast['voice_map'], engine_code)}\n"
+                    f"📦 {len(paths)} tập — đang gửi...",
+                )
+
+            engine_label = {"zerotts": "ZeroTTS", "vieneu": "VieNeu"}.get(engine_code, "Vbee")
+            for i, pth in enumerate(paths, 1):
+                part = f" — Phần {i}/{len(paths)}" if len(paths) > 1 else ""
+                size_mb = pth.stat().st_size / (1024 * 1024)
+                caption = "\n".join([
+                    f"🎧 <b>{cast['title_vi']}</b>{part}",
+                    (f"🎬 <b>Từ video:</b> <i>{cast['video_title']}</i>" if cast.get("video_title") else ""),
+                    f"👤: {cast['author']} • <b>Nguồn:</b> {cast['domain']}",
+                    f"🎭 {describe_cast(cast['voice_map'], engine_code)}",
+                    f"🎙️ {engine_label} {speed}x • {size_mb:.1f}MB",
+                    f"📝 #podcast #daydu #phanbien",
+                ])
+                caption = "\n".join(l for l in caption.split("\n") if l)
+                self.send_audio(
+                    chat_id, pth, caption=caption,
+                    title=f"{cast['title_vi']}{part}",
+                    performer=f"{cast['author']} • {cast['host_reader']}",
+                    reply_to_message_id=msg_id, thread_id=thread_id,
+                )
+        finally:
+            turns_path.unlink(missing_ok=True)
+            self.pending_casts.pop(token, None)
+            self._save_pending_casts()
 
     def process_article_job(self, job: dict[str, Any]) -> None:
         job_type = job.get("type", "article_translate_audio")
@@ -3755,11 +4809,14 @@ class TelegramBookBot:
         is_yt = is_youtube_url(url)
         try:
             if is_yt:
+                sb_on, sb_cats = self._sponsor_opts(job)
                 article = youtube_to_article(
                     url,
                     start_time=job.get("start_time"),
                     end_time=job.get("end_time"),
                     chapter=job.get("chapter"),
+                    skip_sponsors=sb_on,
+                    sponsor_categories=sb_cats,
                 )
             else:
                 article = fetch_and_parse_article(url)
@@ -3830,7 +4887,7 @@ class TelegramBookBot:
                         f"📍 <i>Chuyển đổi nội dung thành kịch bản podcast deep-dive...</i>",
                     )
 
-                from generate_podcast import generate_podcast_script, call_vieneu_tts, PODCASTS_DIR
+                from generate_podcast import generate_podcast_script, call_vieneu_tts
                 try:
                     podcast_script = generate_podcast_script(
                         text=translated.content_vi,
@@ -3915,27 +4972,44 @@ class TelegramBookBot:
                     except Exception:
                         pass
 
+                from ebook_translator.core.podcast_rss import embed_cover_to_mp3
+
+                ep_covers_dir = PODCASTS_DIR / "episode_covers"
+                ep_covers_dir.mkdir(parents=True, exist_ok=True)
+                clean_stem = (
+                    audio_path.stem
+                    .replace("_podcast_tinh_gon", "")
+                    .replace("_podcast_chuyen_sau", "")
+                    .replace("_podcast", "")
+                    .replace("_audio", "")
+                    .replace("_short_short", "")
+                    .replace("_short", "")
+                )
+                ep_cover_dest = ep_covers_dir / f"{clean_stem}.jpg"
+
                 if is_yt:
                     from ebook_translator.core.youtube import generate_youtube_podcast_cover
-                    from scripts.update_podcast_episode_covers import embed_cover_to_mp3
+                    if not ep_cover_dest.exists():
+                        generate_youtube_podcast_cover(url, ep_cover_dest)
+                else:
+                    # Tạo ảnh bìa đồ họa độc bản 1400x1400 cho bài viết web
+                    from scripts.build_all_episode_artwork import create_branded_artwork
+                    if not ep_cover_dest.exists():
+                        art_author = getattr(translated, "author", None) or "Trợ Lý Mit"
+                        create_branded_artwork(
+                            title=translated.title_vi if translated else audio_path.stem,
+                            author=art_author,
+                            badge="BÀI VIẾT",
+                            theme="navy",
+                            output_path=ep_cover_dest,
+                        )
 
-                    ep_covers_dir = PODCASTS_DIR / "episode_covers"
-                    ep_covers_dir.mkdir(parents=True, exist_ok=True)
-                    clean_stem = (
-                        audio_path.stem
-                        .replace("_podcast_tinh_gon", "")
-                        .replace("_podcast_chuyen_sau", "")
-                        .replace("_podcast", "")
-                        .replace("_audio", "")
-                        .replace("_short_short", "")
-                        .replace("_short", "")
-                    )
-                    yt_cover_path = ep_covers_dir / f"{clean_stem}.jpg"
-                    if not yt_cover_path.exists():
-                        generate_youtube_podcast_cover(url, yt_cover_path)
-
-                    if yt_cover_path.exists():
-                        embed_cover_to_mp3(audio_path, yt_cover_path)
+                if ep_cover_dest.exists():
+                    embed_cover_to_mp3(audio_path, ep_cover_dest)
+                    # Nếu có file gốc trong output/articles, nhúng cả 2 file
+                    orig_art = PROJECT_DIR / "output" / "articles" / audio_path.name
+                    if orig_art.exists() and orig_art.resolve() != audio_path.resolve():
+                        embed_cover_to_mp3(orig_art, ep_cover_dest)
 
                 # Luôn cập nhật Private RSS Feed cho Apple Podcasts & CarPlay
                 update_podcast_feed()
@@ -4007,6 +5081,8 @@ class TelegramBookBot:
                     f"🎧 {reader_name} ({engine_label}, {podcast_speed}x)",
                     desc_line,
                 ]
+            if article.sponsor_note:
+                caption_lines.append(f"🚫 Đã cắt {article.sponsor_note}")
             caption = "\n".join(caption_lines)
             audio_title = display_title
             self.send_audio(
@@ -4179,6 +5255,144 @@ class TelegramBookBot:
             # Nghỉ 300 giây (5 phút) trước lần kiểm tra kế tiếp
             time.sleep(300)
 
+    # ── 8b. Vòng lặp Đồng bộ Podcast RSS Feed Hàng ngày ──
+    def daily_podcast_sync_loop(self) -> None:
+        """Tự động quét và đồng bộ feed.xml podcast hàng ngày.
+        
+        - Mỗi 30 phút: kiểm tra xem có file MP3 mới chưa có trong feed.xml không.
+          Nếu có → tái tạo feed.xml ngay lập tức.
+        - Mỗi ngày 1 lần (mặc định lúc 06:00): tái tạo toàn bộ feed.xml bất kể có thay đổi hay không,
+          đảm bảo pubDate, GUID và ảnh bìa luôn chuẩn xác.
+        """
+        import datetime as dt
+        print("🔄 Khởi động Scheduler đồng bộ Podcast RSS Feed hàng ngày...")
+        last_daily_sync_date = ""
+
+        while self.running:
+            try:
+                sync_cfg = self.settings.get("podcast_sync", {})
+                enabled = sync_cfg.get("enabled", True)
+                daily_hour = sync_cfg.get("hour", 6)  # Giờ chạy full-sync hàng ngày (mặc định 06:00)
+
+                if not enabled:
+                    time.sleep(1800)  # Nghỉ 30 phút nếu bị tắt
+                    continue
+
+                now = dt.datetime.now()
+                today_str = now.strftime("%Y-%m-%d")
+
+                from ebook_translator.core.podcast_rss import (
+                    scan_podcast_episodes,
+                    update_podcast_feed,
+                    PODCASTS_DIR,
+                )
+                from pathlib import Path
+                import xml.etree.ElementTree as ET
+
+                feed_path = PODCASTS_DIR / "feed.xml"
+                need_regen = False
+                new_episode_titles = []
+
+                # ── Kiểm tra file MP3 mới chưa có trong feed ──
+                if feed_path.exists():
+                    try:
+                        tree = ET.parse(feed_path)
+                        existing_filenames = set()
+                        for item in tree.getroot().find("channel").findall("item"):
+                            enc = item.find("enclosure")
+                            if enc is not None:
+                                url = enc.attrib.get("url", "")
+                                # Trích xuất tên file từ URL: /audio/filename.mp3?v=...
+                                fname = url.split("/audio/")[-1].split("?")[0] if "/audio/" in url else ""
+                                if fname:
+                                    import urllib.parse
+                                    existing_filenames.add(urllib.parse.unquote(fname))
+
+                        # Quét file MP3 hiện có trên đĩa
+                        articles_dir = PODCASTS_DIR.parent / "articles"
+                        current_mp3s = set()
+                        for d in [PODCASTS_DIR, articles_dir]:
+                            if d.exists():
+                                for mp3 in d.glob("*.mp3"):
+                                    if mp3.stat().st_size >= 100 * 1024:
+                                        current_mp3s.add(mp3.name)
+
+                        new_files = current_mp3s - existing_filenames
+                        # Cũng kiểm tra file đã bị xóa
+                        deleted_files = existing_filenames - current_mp3s
+
+                        if new_files or deleted_files:
+                            need_regen = True
+                            for f in list(new_files)[:5]:
+                                new_episode_titles.append(f)
+                            if new_files:
+                                print(f"[PodcastSync] 🆕 Phát hiện {len(new_files)} file MP3 mới chưa có trong feed")
+                            if deleted_files:
+                                print(f"[PodcastSync] 🗑️ Phát hiện {len(deleted_files)} file đã xóa khỏi đĩa")
+                    except Exception as parse_err:
+                        print(f"[PodcastSync] ⚠️ Không thể parse feed.xml hiện tại: {parse_err}")
+                        need_regen = True
+                else:
+                    # Chưa có feed.xml → tạo mới
+                    need_regen = True
+                    print("[PodcastSync] 📝 Chưa có feed.xml, sẽ tạo mới")
+
+                # ── Full-sync hàng ngày vào giờ cấu hình ──
+                if today_str != last_daily_sync_date and now.hour >= daily_hour:
+                    need_regen = True
+                    print(f"[PodcastSync] 📅 Full-sync hàng ngày ({today_str}, {daily_hour}:00)")
+
+                # ── Tái tạo feed.xml ──
+                if need_regen:
+                    old_count = 0
+                    if feed_path.exists():
+                        try:
+                            old_tree = ET.parse(feed_path)
+                            old_count = len(old_tree.getroot().find("channel").findall("item"))
+                        except Exception:
+                            pass
+
+                    result_path = update_podcast_feed()
+
+                    new_count = 0
+                    try:
+                        new_tree = ET.parse(result_path)
+                        new_count = len(new_tree.getroot().find("channel").findall("item"))
+                    except Exception:
+                        pass
+
+                    # Cập nhật mốc đồng bộ ngày
+                    if today_str != last_daily_sync_date and now.hour >= daily_hour:
+                        last_daily_sync_date = today_str
+
+                    # Gửi thông báo qua Telegram nếu có file mới
+                    if new_episode_titles and self.default_chat_id:
+                        ep_list = "\n".join([f"  • {t[:50]}" for t in new_episode_titles[:5]])
+                        extra = f"\n  ... và {len(new_episode_titles) - 5} tập khác" if len(new_episode_titles) > 5 else ""
+                        msg = (
+                            f"🔄 <b>Podcast Feed đã tự động cập nhật</b>\n"
+                            f"📊 Tổng: <b>{new_count} tập</b> (trước: {old_count})\n"
+                            f"🆕 Tập mới:\n{ep_list}{extra}"
+                        )
+                        try:
+                            self.send_message(
+                                self.default_chat_id,
+                                msg,
+                                thread_id=self.default_topic_id,
+                            )
+                        except Exception:
+                            pass
+
+                    print(f"[PodcastSync] ✅ Đã đồng bộ feed.xml ({new_count} tập)")
+
+            except Exception as e:
+                print(f"[PodcastSync] Lỗi vòng lặp: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+
+            # Nghỉ 1800 giây (30 phút) trước lần kiểm tra kế tiếp
+            time.sleep(1800)
+
     # ── 9. Đăng ký menu lệnh với Telegram API ──
     def register_bot_commands(self) -> None:
         commands = [
@@ -4199,7 +5413,10 @@ class TelegramBookBot:
             {"command": "ask", "description": "🧠 Hỏi đáp phản biện với nội dung sách"},
             {"command": "mode", "description": "⚙️ Cài đặt chế độ xử lý mặc định"},
             {"command": "model", "description": "🧠 Chọn mô hình AI (Flash / Pro)"},
+            {"command": "sponsorblock", "description": "🚫 Bật/tắt cắt quảng cáo tài trợ trong video"},
             {"command": "status", "description": "🟢 Kiểm tra hàng đợi & hệ thống"},
+            {"command": "heal", "description": "🤖 Antigravity Auto-Heal: Tự sửa lỗi code & hệ thống"},
+            {"command": "heallog", "description": "📋 Lịch sử các lần Antigravity tự sửa lỗi"},
             {"command": "help", "description": "❓ Trợ giúp nhanh cách gửi sách"},
         ]
         try:
@@ -4235,6 +5452,9 @@ class TelegramBookBot:
 
         rec_scheduler = threading.Thread(target=self.weekly_recommendation_loop, daemon=True)
         rec_scheduler.start()
+
+        podcast_sync = threading.Thread(target=self.daily_podcast_sync_loop, daemon=True)
+        podcast_sync.start()
 
         # Khởi động máy chủ Private Podcast RSS Server cho Apple Podcasts & CarPlay
         try:
