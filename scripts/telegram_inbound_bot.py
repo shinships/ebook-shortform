@@ -1582,7 +1582,11 @@ class TelegramBookBot:
                     list_voices_by_gender(cast["engine"], gender)
                     + list_voices_by_gender(cast["engine"], "male" if gender == "female" else "female")
                 )
-                taken = {v for k, v in cast["voice_map"].items() if k != sid}
+                # "HOST" chỉ là giọng đọc phần phản biện cuối tập, không phải một
+                # vai hội thoại thật — không loại nó khỏi danh sách chọn cho S1/S2,
+                # để người dùng vẫn có thể gán giọng host (vd. Minh Quân) cho một
+                # vai trong video nhiều giọng nếu muốn.
+                taken = {v for k, v in cast["voice_map"].items() if k != sid and k != "HOST"}
                 opts = [v for v in opts if v not in taken][:12]
                 cast["_opts"] = {str(i): v for i, v in enumerate(opts)}
                 self._save_pending_casts()
