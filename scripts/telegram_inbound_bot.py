@@ -3755,8 +3755,10 @@ class TelegramBookBot:
         # ── TRƯỜNG HỢP D: XỬ LÝ BÀI VIẾT TỪ LIÊN KẾT (URL) ──
         if job_type == "article_yt_podcast_full":
             self.process_yt_full_podcast_job(job)
+            return
         elif job_type == "article_yt_podcast_render":
             self.process_yt_full_podcast_render(job)
+            return
         elif job_type.startswith("article_"):
             self.process_article_job(job)
             return

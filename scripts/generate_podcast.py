@@ -684,6 +684,13 @@ def create_podcast_for_book(
 
     content = extract_text_from_file(input_path)
     clean_title = clean_stem.replace("_", " ").strip()
+
+    # Chỉ khác None khi mode="deep" phát hiện script gốc đã là hội thoại nhiều
+    # người nói (xem nhánh is_deep bên dưới) — lúc đó bỏ qua call_tts() một
+    # giọng, render_multivoice() sẽ đọc nguyên văn với dàn giọng tự chọn.
+    multi_voice_map: dict[str, str] | None = None
+    multi_turns: list[tuple[str, str]] | None = None
+
     if is_direct:
         script_file = PODCASTS_DIR / f"{clean_stem}_audio_script.txt"
         output_mp3 = PODCASTS_DIR / f"{clean_stem}_audio.mp3"
@@ -703,7 +710,52 @@ def create_podcast_for_book(
             print(f"📄 Dùng trực tiếp kịch bản có sẵn: {use_existing_script}")
             script = Path(use_existing_script).read_text(encoding="utf-8")
         else:
-            script = generate_podcast_script(content, book_title=clean_title, voice_code=target_voice, mode="deep", engine=active_engine)
+            from ebook_translator.core.speakers import detect_speakers
+
+            # use_llm_segmentation=False: không tốn lượt LLM dò mù ranh giới lượt
+            # nói trên văn bản độc thoại bình thường (đa số sách/bài viết). Chỉ
+            # nhận multi-speaker qua tín hiệu cấu trúc rẻ tiền (nhãn "Tên:" hoặc
+            # marker ">>") có sẵn trong script gốc; suy giới tính vẫn dùng LLM.
+            plan = detect_speakers(
+                content, video_info={"title": clean_title}, use_llm=True, use_llm_segmentation=False,
+            )
+
+            if plan.is_multi:
+                from ebook_translator.core.tts import describe_cast, pick_voices_for_cast
+
+                print(
+                    f"🗣️ [deep] Script gốc có {len(plan.speakers)} người nói (qua '{plan.source}') "
+                    f"— đọc nguyên văn, đã bỏ tên ở đầu lượt, tự động chọn giọng theo giới tính."
+                )
+                roster = plan.gender_roster()
+
+                # Video có từ 2 giọng nam trở lên: gán thẳng giọng mặc định người
+                # dùng đã chọn (target_voice) cho vai khách mời nam đầu tiên, thay
+                # vì để pick_voices_for_cast() né nó — giữ đúng bản sắc giọng đọc
+                # quen thuộc của kênh cho vai khách mời, các vai nam còn lại mới
+                # tự động chọn giọng khác để phân biệt.
+                overrides: dict[str, str] = {}
+                male_ids = [sid for sid, g in roster.items() if g == "male"]
+                if len(male_ids) >= 2:
+                    guest_male = next(
+                        (s.id for s in plan.speakers if s.role == "guest" and roster.get(s.id) == "male"),
+                        None,
+                    )
+                    if guest_male:
+                        overrides[guest_male] = target_voice
+
+                multi_voice_map = pick_voices_for_cast(
+                    roster, engine=active_engine, overrides=overrides or None,
+                )
+                multi_turns = plan.turns
+                print(f"🎭 Dàn giọng: {describe_cast(multi_voice_map, active_engine)}")
+                # QUAN TRỌNG: script lưu ra phải khớp nguyên văn với audio (không có
+                # nhãn tên) — nó được render_short_reel.py dùng làm ground-truth cho
+                # Whisper forced alignment khi tạo phụ đề Video Reel; chèn "Tên:" vào
+                # đây sẽ làm phụ đề lệch so với lời đọc thật.
+                script = "\n\n".join(t for _, t in plan.turns)
+            else:
+                script = generate_podcast_script(content, book_title=clean_title, voice_code=target_voice, mode="deep", engine=active_engine)
     else:
         script_file = PODCASTS_DIR / f"{clean_stem}_podcast_tinh_gon_script.txt"
         output_mp3 = PODCASTS_DIR / f"{clean_stem}_podcast_tinh_gon.mp3"
@@ -720,15 +772,26 @@ def create_podcast_for_book(
         print("🛑 Chế độ --script-only: Hoàn tất lưu kịch bản, bỏ qua tổng hợp âm thanh.")
         return script_file
 
-    success = call_tts(
-        text=script,
-        output_path=output_mp3,
-        voice=target_voice,
-        engine=active_engine,
-        speed=speed,
-        ref_audio=ref_audio,
-        fallback=True,
-    )
+    if multi_voice_map is not None and multi_turns is not None:
+        from ebook_translator.core.tts import render_multivoice
+
+        success = render_multivoice(
+            turns=multi_turns,
+            output_path=output_mp3,
+            voice_map=multi_voice_map,
+            engine=active_engine,
+            speed=speed,
+        )
+    else:
+        success = call_tts(
+            text=script,
+            output_path=output_mp3,
+            voice=target_voice,
+            engine=active_engine,
+            speed=speed,
+            ref_audio=ref_audio,
+            fallback=True,
+        )
 
     if success:
 
